@@ -123,21 +123,21 @@
             float n2 = fbm(vPos*8.0 + uTime*0.8);
             float heat = (n*0.6 + n2*0.4)*0.5 + 0.6;
             heat = clamp(heat*uHeat, 0.0, 1.6);
-            // fire gradient: dark red -> orange -> yellow -> white
-            vec3 col = vec3(0.35,0.02,0.0);
-            col = mix(col, vec3(1.0,0.25,0.0), smoothstep(0.30,0.75,heat));
-            col = mix(col, vec3(1.0,0.75,0.10), smoothstep(0.70,1.05,heat));
-            col = mix(col, vec3(1.0,0.97,0.80), smoothstep(1.00,1.45,heat));
-            gl_FragColor = vec4(col*2.2, 1.0);
+            // fire gradient: deep red -> orange -> golden yellow (no blown-out white)
+            vec3 col = vec3(0.30,0.015,0.0);
+            col = mix(col, vec3(0.95,0.16,0.0), smoothstep(0.30,0.72,heat));
+            col = mix(col, vec3(1.0,0.52,0.05), smoothstep(0.68,1.05,heat));
+            col = mix(col, vec3(1.0,0.80,0.28), smoothstep(1.05,1.50,heat));
+            gl_FragColor = vec4(col*1.7, 1.0);
           }`,
       });
       ballCore = new THREE.Mesh(new THREE.IcosahedronGeometry(0.1, 5), coreMat);
       group.add(ballCore);
 
-      // White-hot molten core peeking through the flames
+      // Molten core glowing through the flames (amber, not white)
       ballHot = new THREE.Mesh(
-        new THREE.SphereGeometry(0.07, 20, 20),
-        new THREE.MeshBasicMaterial({ color: 0xfff0cc, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false })
+        new THREE.SphereGeometry(0.06, 16, 16),
+        new THREE.MeshBasicMaterial({ color: 0xffaa44, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false })
       );
       group.add(ballHot);
 
@@ -189,6 +189,7 @@
 
       ball = makeFireBall();
       scene.add(ball);
+      embers = new EmberSystem(700);
 
       if (preview) initPreview();
       else await initXR();
@@ -288,20 +289,31 @@
     }
 
     /* ---------- INTERACTION ---------- */
+    // throw physics: we track the controller's velocity so a flick of the arm
+    // throws the ball; the orbit adds spin/tangential momentum on top.
+    const ctrlVel = new THREE.Vector3();
+    const ctrlPrev = new THREE.Vector3();
+    const orbitTangent = new THREE.Vector3();
+    const _hand = new THREE.Vector3();
+    const _v = new THREE.Vector3();
+    let ctrlHasPrev = false;
+
     function grab(controller) {
-      // ignore controllers that aren't tracked yet (would report origin)
       mode = 'attracted';
       targetController = controller;
+      ctrlVel.set(0, 0, 0);
+      ctrlHasPrev = false;
     }
     function release() {
       if (mode !== 'attracted') return;
       mode = 'free';
-      const speed = 4.5;
-      velocity.set(
-        -Math.sin(orbitAngle) * speed,
-        2.5 + Math.random() * 1.5,
-        Math.cos(orbitAngle) * speed - 2.0
-      );
+      // ARM THROW dominates: your hand's release velocity, amplified...
+      velocity.copy(ctrlVel).multiplyScalar(2.0);
+      // ...plus the orbit's tangential momentum (the spin) layered on top
+      velocity.addScaledVector(orbitTangent, 2.2);
+      velocity.y += 0.8;                 // slight lift so it arcs
+      const maxS = 12;
+      if (velocity.length() > maxS) velocity.setLength(maxS);
       flameBurst(ball.position, 18, true);
     }
 
@@ -322,16 +334,18 @@
       varying float vT; uniform float uTime, uOpacity, uSeed;
       void main(){
         float t = vT;
-        vec3 white  = vec3(1.0, 0.95, 0.75);
-        vec3 yellow = vec3(1.0, 0.72, 0.18);
-        vec3 orange = vec3(1.0, 0.34, 0.03);
-        vec3 red    = vec3(0.45, 0.03, 0.0);
-        vec3 col = mix(white, yellow, smoothstep(0.0, 0.18, t));
-        col = mix(col, orange, smoothstep(0.15, 0.5, t));
-        col = mix(col, red,    smoothstep(0.5, 1.0, t));
+        // hottest is a warm yellow (only a tiny near-white speck at the very tip)
+        vec3 yellow = vec3(1.0, 0.78, 0.30);
+        vec3 orange = vec3(1.0, 0.40, 0.05);
+        vec3 red    = vec3(0.80, 0.13, 0.0);
+        vec3 dark   = vec3(0.28, 0.02, 0.0);
+        vec3 col = mix(yellow, orange, smoothstep(0.0, 0.30, t));
+        col = mix(col, red,  smoothstep(0.28, 0.65, t));
+        col = mix(col, dark, smoothstep(0.62, 1.0, t));
+        col += vec3(0.15) * (1.0 - smoothstep(0.0, 0.06, t)); // faint hot speck at the tip
         float flick = 0.7 + 0.3*sin(uTime*26.0 + uSeed + t*42.0);
-        float alpha = uOpacity * pow(1.0 - t, 1.25) * flick;
-        gl_FragColor = vec4(col * (2.7 - t*2.0), alpha);
+        float alpha = uOpacity * pow(1.0 - t, 1.3) * flick;
+        gl_FragColor = vec4(col * (1.45 - t*0.9), alpha);
       }`;
 
     class FlameJet {
@@ -343,13 +357,16 @@
         this.radius = opts.radius != null ? opts.radius : (0.03 + Math.random() * 0.015);
         this.fade = opts.fade != null ? opts.fade : (0.016 + Math.random() * 0.012);
         this.buoyancy = opts.buoyancy != null ? opts.buoyancy : 0.7;
-        this.opacity = 1; this.age = 0;
+        this.opacity = 1; this.age = 0; this.emberAcc = 0;
         this.points = [origin.clone(), origin.clone().addScaledVector(this.dir, 0.002)];
-        // gentle, slowly-changing curl about a perpendicular axis -> licking flame, not a coil
+        // two perpendicular axes for layered, serpentine meander (a flowing snake of fire, not a coil)
         this.axis = new THREE.Vector3().crossVectors(this.dir, new THREE.Vector3(0, 1, 0));
         if (this.axis.lengthSq() < 1e-4) this.axis.set(1, 0, 0);
         this.axis.normalize();
-        this.curl = (Math.random() - 0.5) * 2.4;
+        this.axis2 = new THREE.Vector3().crossVectors(this.dir, this.axis).normalize();
+        this.curl = (Math.random() - 0.5) * 1.6;
+        this.f1 = 3 + Math.random() * 4;  this.a1 = 4 + Math.random() * 5; this.p1 = Math.random() * 6.28;
+        this.f2 = 2 + Math.random() * 3;  this.a2 = 3 + Math.random() * 4; this.p2 = Math.random() * 6.28;
         this.material = new THREE.ShaderMaterial({
           uniforms: { uTime: { value: 0 }, uOpacity: { value: 1 }, uRadius: { value: this.radius }, uSeed: { value: Math.random() * 6.283 } },
           vertexShader: FLAME_VERT, fragmentShader: FLAME_FRAG,
@@ -362,9 +379,10 @@
       _geo() { return new THREE.TubeGeometry(this.curve, Math.max(2, this.points.length - 1), this.radius, 6, false); }
       update(delta) {
         this.age += delta;
-        // steer the head: slow curl + buoyancy (flames rise)
-        this.dir.applyAxisAngle(this.axis, this.curl * delta);
-        this.dir.y += this.buoyancy * delta;
+        // steer the head: layered serpentine meander on two axes + rising buoyancy
+        this.dir.applyAxisAngle(this.axis, (this.curl + Math.sin(this.age * this.f1 + this.p1) * this.a1) * delta);
+        this.dir.applyAxisAngle(this.axis2, (Math.sin(this.age * this.f2 + this.p2) * this.a2) * delta);
+        this.dir.y += this.buoyancy * delta;        // flames rise as they slow
         this.dir.normalize();
         const sp = this.speed * (1 + Math.sin(this.age * 6) * 0.25);
         this.points[0].addScaledVector(this.dir, sp * delta);
@@ -372,7 +390,11 @@
         const a = 1 - Math.exp(-14 * delta);
         for (let i = 1; i < this.points.length; i++) this.points[i].lerp(this.points[i - 1], a);
         if (this.points.length < this.maxPoints) this.points.push(this.points[this.points.length - 1].clone());
-        this.speed *= Math.max(0, 1 - 2.0 * delta);
+        // shed embers along the flame's path
+        this.emberAcc += delta;
+        if (this.emberAcc > 0.06 && this.opacity > 0.3) { this.emberAcc = 0; spawnEmber(this.points[0], 0.2); }
+        this.speed *= Math.max(0, 1 - 1.4 * delta);  // travel further (less drag) -> spreads more
+        this.buoyancy += 0.6 * delta;                // rise more as it ages
         this.opacity -= this.fade * delta * 60;
         this.curve.points = this.points;
         this.mesh.geometry.dispose();
@@ -396,6 +418,7 @@
           ? { speed: 2.2 + Math.random() * 1.6, maxPoints: 26, radius: 0.04 + Math.random() * 0.02, fade: 0.013 }
           : { speed: 1.5 + Math.random() * 1.2, maxPoints: 20, radius: 0.03 + Math.random() * 0.015, fade: 0.018 }));
       }
+      emberBurst(pos, big ? 26 : 14);   // every impact showers embers
     }
     // Continuous licking flames so the ball is always visibly ablaze (rise upward)
     let emitAcc = 0;
@@ -406,8 +429,83 @@
         if (flames.length > 55) break;
         const d = randDir(); d.y = Math.abs(d.y) * 0.5 + 0.5; d.normalize();
         flames.push(new FlameJet(pos, d, { speed: 0.8 + Math.random() * 0.6, maxPoints: 12, radius: 0.02 + Math.random() * 0.012, fade: 0.03 + Math.random() * 0.02, buoyancy: 1.3 }));
+        if (Math.random() < 0.6) spawnEmber(pos, 0.5);   // ball constantly sheds embers
       }
     }
+
+    /* ---------- EMBERS ---------- */
+    // A GPU-rendered pool of glowing embers that rise then fall under gravity and fade.
+    class EmberSystem {
+      constructor(max) {
+        this.max = max; this.cursor = 0;
+        this.pos = new Float32Array(max * 3);
+        this.col = new Float32Array(max * 3);
+        this.life = new Float32Array(max);   // 1 -> 0
+        this.size = new Float32Array(max);
+        this.vel = []; for (let i = 0; i < max; i++) { this.vel.push(new THREE.Vector3()); this.pos[i * 3 + 1] = -9999; }
+        this.maxLife = new Float32Array(max);
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
+        g.setAttribute('aColor', new THREE.BufferAttribute(this.col, 3));
+        g.setAttribute('aLife', new THREE.BufferAttribute(this.life, 1));
+        g.setAttribute('aSize', new THREE.BufferAttribute(this.size, 1));
+        this.geo = g;
+        this.mat = new THREE.ShaderMaterial({
+          uniforms: { uScale: { value: 650.0 } },
+          transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+          vertexShader: `
+            uniform float uScale;
+            attribute vec3 aColor; attribute float aLife; attribute float aSize;
+            varying vec3 vColor; varying float vLife;
+            void main(){ vColor=aColor; vLife=aLife;
+              vec4 mv = modelViewMatrix * vec4(position,1.0);
+              gl_PointSize = clamp(aSize * (uScale / -mv.z), 1.0, 60.0);
+              gl_Position = projectionMatrix * mv; }`,
+          fragmentShader: `
+            varying vec3 vColor; varying float vLife;
+            void main(){ if(vLife<=0.0) discard;
+              vec2 d = gl_PointCoord - 0.5; float r = length(d);
+              if(r>0.5) discard;
+              float a = smoothstep(0.5,0.0,r) * vLife;
+              gl_FragColor = vec4(vColor * (0.7 + vLife*0.6), a); }`
+        });
+        this.points = new THREE.Points(g, this.mat);
+        this.points.frustumCulled = false;
+        scene.add(this.points);
+      }
+      spawn(p, v, color, life, size) {
+        const i = this.cursor; this.cursor = (this.cursor + 1) % this.max;
+        this.pos[i*3] = p.x; this.pos[i*3+1] = p.y; this.pos[i*3+2] = p.z;
+        this.vel[i].copy(v);
+        this.col[i*3] = color.r; this.col[i*3+1] = color.g; this.col[i*3+2] = color.b;
+        this.life[i] = 1; this.maxLife[i] = life; this.size[i] = size;
+      }
+      update(delta) {
+        for (let i = 0; i < this.max; i++) {
+          if (this.life[i] <= 0) continue;
+          const v = this.vel[i];
+          v.y -= 2.2 * delta;                    // gravity -> embers drop
+          v.multiplyScalar(Math.max(0, 1 - 0.5 * delta));
+          this.pos[i*3] += v.x*delta; this.pos[i*3+1] += v.y*delta; this.pos[i*3+2] += v.z*delta;
+          this.life[i] = Math.max(0, this.life[i] - delta / this.maxLife[i]);
+        }
+        this.geo.attributes.position.needsUpdate = true;
+        this.geo.attributes.aLife.needsUpdate = true;
+        this.geo.attributes.aColor.needsUpdate = true;
+        this.geo.attributes.aSize.needsUpdate = true;
+      }
+    }
+    let embers = null;
+    const _ec = new THREE.Color();
+    // one ember: small upward kick, then gravity drags it down as it cools & fades
+    function spawnEmber(pos, up) {
+      if (!embers) return;
+      _ev.set((Math.random()-0.5)*0.7, (up||0.4) + Math.random()*0.7, (Math.random()-0.5)*0.7);
+      _ec.setHSL(0.04 + Math.random()*0.06, 1.0, 0.5 + Math.random()*0.08); // amber/orange, never white
+      embers.spawn(pos, _ev, _ec, 0.9 + Math.random()*1.3, 0.018 + Math.random()*0.03);
+    }
+    function emberBurst(pos, n) { for (let i = 0; i < n; i++) spawnEmber(pos, 0.6 + Math.random()*1.2); }
+    const _ev = new THREE.Vector3();
 
     /* ---------- REAL-WORLD PLANES + COLLISION ---------- */
     // Rebuild colliders from the headset's detected real-world planes each frame.
@@ -473,23 +571,36 @@
       if (isPreview) {
         demoT += delta;
         if (mode === 'idle' && demoT > 1.5) { orbitAngle = 0; mode = 'attracted'; targetController = null; }
-        else if (mode === 'attracted' && demoT > 4.0) { release(); demoT = 0; }
+        else if (mode === 'attracted' && demoT > 4.0) {
+          // simulate an arm-throw in a varied direction so the throw mechanic is visible
+          ctrlVel.set((Math.random() - 0.5) * 5, 1.2 + Math.random() * 1.5, -2 - Math.random() * 2.5);
+          release(); demoT = 0;
+        }
       }
 
       if (mode === 'attracted') {
         orbitAngle += 6 * delta;
         // anchor: real controller in AR, or a point in front of camera in preview
         let anchor;
-        if (targetController) anchor = targetController.getWorldPosition(tempVec);
-        else { anchor = tempVec.copy(homePos); }
-        const r = 0.35;
+        if (targetController) {
+          anchor = targetController.getWorldPosition(_hand);
+          // track the controller's velocity (smoothed) so we can throw with the arm
+          if (ctrlHasPrev) {
+            _v.subVectors(anchor, ctrlPrev).divideScalar(Math.max(delta, 1e-3));
+            ctrlVel.lerp(_v, 1 - Math.exp(-18 * delta));
+          }
+          ctrlPrev.copy(anchor); ctrlHasPrev = true;
+        } else { anchor = tempVec.copy(homePos); }
+        const r = 0.32;
         const desired = new THREE.Vector3(
           anchor.x + Math.cos(orbitAngle) * r,
           anchor.y + 0.05 + Math.sin(orbitAngle * 1.7) * 0.12,
           anchor.z + Math.sin(orbitAngle) * r
         );
-        // smooth magnetic pull (frame-rate independent)
-        ball.position.lerp(desired, 1 - Math.exp(-9 * delta));
+        // snappy magnetic pull (frame-rate independent)
+        ball.position.lerp(desired, 1 - Math.exp(-12 * delta));
+        // orbit's tangential direction (for throw spin) scaled by orbit speed * radius
+        orbitTangent.set(-Math.sin(orbitAngle), 0.12, Math.cos(orbitAngle)).normalize();
         ballCore.material.uniforms.uHeat.value = 1.5; // hotter while charging
       } else if (mode === 'free') {
         ballCore.material.uniforms.uHeat.value = 1.1;
@@ -513,11 +624,12 @@
       emitFlames(ball.position, delta);
 
       // pulse the white-hot core
-      ballHot.material.opacity = 0.8 + Math.sin(t * 20) * 0.12;
+      ballHot.material.opacity = 0.45 + Math.sin(t * 20) * 0.1;
 
       for (let i = flames.length - 1; i >= 0; i--) {
         if (!flames[i].update(delta)) { flames[i].dispose(); flames.splice(i, 1); }
       }
+      embers.update(delta);
 
       renderer.render(scene, camera);
     }
