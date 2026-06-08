@@ -1,0 +1,1569 @@
+<!DOCTYPE html>
+<html lang="en" translate="no" class="notranslate">
+
+<head>
+  <title>Flame Thrower</title>
+  <link rel="icon" href="images/Y.png" type="image/png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&display=swap" rel="stylesheet">
+  <meta name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="google" content="notranslate">
+  <meta http-equiv="Content-Language" content="en">
+  <style>
+    html,
+    body {
+      height: 100%;
+      overscroll-behavior: none;
+    }
+
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      touch-action: none;
+    }
+
+    canvas {
+      width: 100vw;
+      height: 100dvh;
+      touch-action: none;
+      display: block;
+    }
+
+    @media (max-width: 768px) {
+      canvas {
+        width: 100vw;
+        height: 100dvh;
+        transform: scale(1);
+        transform-origin: 0 0;
+      }
+    }
+
+    #intro-text {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: white;
+      font-family: 'Orbitron', sans-serif;
+      font-size: clamp(24px, 5vw, 36px);
+      opacity: 0;
+      pointer-events: none;
+      text-align: center;
+      line-height: 1.5;
+      text-shadow: 0 0 10px rgba(255, 85, 0, 0.8);
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.4);
+      padding: 20px;
+      border-radius: 10px;
+      will-change: transform, opacity, filter, letter-spacing;
+      min-height: 3em;
+    }
+
+    @keyframes textReveal {
+      0% {
+        opacity: 0;
+        filter: blur(12px) brightness(2);
+        transform: translate(-50%, -40%) scale(0.9);
+        letter-spacing: -4px;
+      }
+
+      100% {
+        opacity: 1;
+        filter: blur(0px) brightness(1);
+        transform: translate(-50%, -50%) scale(1);
+        letter-spacing: 0;
+      }
+    }
+
+    @keyframes textHide {
+      0% {
+        opacity: 1;
+        filter: blur(0px) brightness(1);
+        transform: translate(-50%, -50%) scale(1);
+        letter-spacing: 0;
+      }
+
+      100% {
+        opacity: 0;
+        filter: blur(12px) brightness(0.5);
+        transform: translate(-50%, -60%) scale(1.1);
+        letter-spacing: 6px;
+      }
+    }
+
+    @media (max-width: 768px) {
+      #intro-text {
+        font-size: clamp(18px, 6vw, 28px);
+        width: 80%;
+        padding: 15px;
+      }
+    }
+
+
+
+  </style>
+</head>
+
+<body>
+  <div id="intro-text" style="display:none; opacity:0; font-family: 'Orbitron', sans-serif;">Take your time<br>Flame
+    Thrower</div>
+  <canvas id="canvas"></canvas>
+
+  <audio id="matchSound" preload="auto">
+    <source src="sounds/match_strike.mp3" type="audio/mpeg">
+  </audio>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const spirals = [];
+    let audioContext;
+    let isHolding = false;
+    let holdDuration = 0;
+    let currentX, currentY;
+    let hasInteracted = false;
+    let ballAnimationActive = false;
+    let matchPlayed = false;
+    let initialSpiralSpawned = false;
+    const introText = document.getElementById('intro-text');
+    let introIntervalId = null;
+    let heatPulse = 0;
+    let heatPulseDirection = 1;
+    let particles = [];
+    let uiScale = 1.0;
+    const wallContact = { left: false, right: false, top: false, bottom: false };
+    let showBall = true;
+    let lastFrameTime = 0;
+    let dtScale = 1; // delta-time scale factor (1.0 = 60fps baseline)
+    let lastBounceAudioTime = 0; // throttle bounce sounds
+    const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || ('ontouchstart' in window);
+    const BOUNCE_AUDIO_COOLDOWN = isMobile ? 260 : 60; // ms minimum between bounce sounds
+    const MAX_CONCURRENT_SIZZLES = isMobile ? 2 : 4; // cap simultaneous sizzle audio streams
+    const activeSizzleSpirals = []; // tracks spirals currently producing sizzle audio
+    let sharedNoiseBuffer = null; // reused across spirals to avoid per-spiral allocation stalls
+    // Pool of independent noise buffers for ONE-SHOT bounce sizzles.
+    // Using independent samples per concurrent bounce eliminates the correlated-noise
+    // summing that caused the random "extra sizzle" artifact on bounces.
+    let bounceNoisePool = null;
+    function getBounceNoisePool() {
+      if (!audioContext) return null;
+      if (!bounceNoisePool) {
+        const sr = audioContext.sampleRate;
+        const nLen = Math.floor(sr * 1.0);
+        bounceNoisePool = [];
+        for (let b = 0; b < 8; b++) {
+          const buf = audioContext.createBuffer(1, nLen, sr);
+          const d = buf.getChannelData(0);
+          for (let i = 0; i < nLen; i++) d[i] = Math.random() * 2 - 1;
+          bounceNoisePool.push(buf);
+        }
+      }
+      return bounceNoisePool;
+    }
+    let sizzleCompressor = null; // shared compressor on the sizzle bus to catch loudness spikes
+    function getSizzleBus() {
+      if (!audioContext) return null;
+      if (!sizzleCompressor) {
+        sizzleCompressor = audioContext.createDynamicsCompressor();
+        sizzleCompressor.threshold.value = -18;
+        sizzleCompressor.knee.value = 6;
+        sizzleCompressor.ratio.value = 6;
+        sizzleCompressor.attack.value = 0.003;
+        sizzleCompressor.release.value = 0.12;
+        sizzleCompressor.connect(audioContext.destination);
+      }
+      return sizzleCompressor;
+    }
+
+
+    // Enhanced audio state management
+    let audioInitialized = false;
+    let audioUnlockAttempts = 0;
+    const maxAudioUnlockAttempts = 3;
+
+    // Ball physics from flamethrower.html (molten core variant)
+    const ball = {
+      x: window.innerWidth / 2,
+      y: window.innerHeight / 2,
+      baseRadius: 40,
+      radius: 40,
+      vx: 0,
+      vy: 0,
+      attraction: 2.0,
+      maxSpeed: 15,
+      lastTrailTime: 0,
+      trailInterval: 50,
+      rotation: 0,
+      rotationSpeed: 0,
+      rotationDamping: 0.98,
+      spinFactor: 0.05
+    };
+
+    // Particle system (keep simple from flamethrower6 style)
+    class Particle {
+      constructor(x, y, isEmber = false) {
+        this.x = x;
+        this.y = y;
+        this.isEmber = isEmber;
+        this.isSpecialEmber = isEmber && Math.random() < 0.3;
+        if (isEmber) {
+          if (this.isSpecialEmber) {
+            this.vx = (Math.random() - 0.5) * 1.2;
+            this.vy = -Math.random() * 2;
+            this.life = Math.random() * 1.8 + 1.0;
+          } else {
+            this.vx = (Math.random() - 0.5) * 0.8;
+            this.vy = -Math.random() * 1.5;
+            this.life = Math.random() * 1.0 + 0.5;
+          }
+        } else {
+          this.vx = (Math.random() - 0.5) * 2;
+          this.vy = -Math.random() * 3 - 1;
+          this.life = Math.random() * 0.6 + 0.5;
+        }
+        this.maxLife = this.life;
+        this.size = isEmber ? (this.isSpecialEmber ? Math.random() * 1.5 + 0.5 : Math.random() * 1 + 0.3) : Math.random() * 2 + 1;
+        this.color = isEmber ? (this.isSpecialEmber ? (Math.random() < 0.05 ? `hsl(${Math.random() * 20 + 325}, 65%, ${Math.random() * 12 + 38}%)` : `hsl(${Math.random() * 45 + 5}, 100%, ${Math.random() * 18 + 45}%)`) : (Math.random() < 0.03 ? `hsl(${Math.random() * 20 + 325}, 60%, ${Math.random() * 10 + 35}%)` : `hsl(${Math.random() * 35 + 5}, 100%, ${Math.random() * 15 + 40}%)`)) : `hsl(${Math.random() * 50 + 10}, 100%, ${Math.random() * 30 + 50}%)`;
+      }
+      update() {
+        const moveScale = this.isEmber ? (window.devicePixelRatio || 1) : 1;
+        this.prevX = this.x;
+        this.prevY = this.y;
+        this.x += this.vx * moveScale;
+        this.y += this.vy * moveScale;
+        if (this.isEmber) {
+          if (this.isSpecialEmber) { this.vy += 0.02; this.vx *= 0.995; this.vx += (Math.random() - 0.5) * 0.1; }
+          else { this.vy += 0.03; this.vx *= 0.99; }
+        } else {
+          this.vy -= 0.05;
+        }
+        this.life -= this.isSpecialEmber ? 0.005 : (this.isEmber ? 0.01 : 0.02);
+        return this.life > 0;
+      }
+      draw() {
+        ctx.globalAlpha = (this.life / this.maxLife) * (this.isEmber ? (this.isSpecialEmber ? 0.75 : 0.55) : 0.4);
+        if (this.isEmber && this.prevX != null) {
+          ctx.strokeStyle = this.color;
+          ctx.lineWidth = this.size * 2;
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(this.prevX, this.prevY);
+          ctx.lineTo(this.x, this.y);
+          ctx.stroke();
+        } else {
+          ctx.beginPath();
+          ctx.fillStyle = this.color;
+          ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+
+    // Resize and DPR handling from flamethrower.html
+    function updateBallSize() {
+      const dpr = window.devicePixelRatio || 1;
+      const minDim = Math.min(window.innerWidth, window.innerHeight);
+      const baseline = 1024;
+      uiScale = Math.max(0.45, Math.min(1.0, minDim / baseline));
+      const desktopBaselineRadius = 30;
+      const visualRadius = desktopBaselineRadius * uiScale;
+      ball.radius = visualRadius * dpr;
+    }
+
+    function resizeCanvas() {
+      const prevWidth = canvas.width || 1;
+      const prevHeight = canvas.height || 1;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(window.innerWidth * dpr);
+      canvas.height = Math.floor(window.innerHeight * dpr);
+      updateBallSize();
+      if (!hasInteracted) {
+        ball.x = canvas.width / 2;
+        ball.y = (canvas.height / 2) - Math.floor(200 * (window.devicePixelRatio || 1));
+      } else {
+        const rx = ball.x / prevWidth;
+        const ry = ball.y / prevHeight;
+        ball.x = Math.max(ball.radius, Math.min(canvas.width - ball.radius, rx * canvas.width));
+        ball.y = Math.max(ball.radius, Math.min(canvas.height - ball.radius, ry * canvas.height));
+      }
+    }
+    resizeCanvas();
+    (function setupResizeListener() {
+      let resizeTimer = null;
+      window.addEventListener('resize', () => {
+        if (resizeTimer) clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => { resizeTimer = null; resizeCanvas(); }, 120);
+      });
+    })();
+
+    // Enhanced audio initialization with better error handling
+    async function initAudio() {
+      if (audioInitialized && audioContext && audioContext.state === 'running') {
+        return true;
+      }
+
+      try {
+        if (!audioContext) {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        if (audioContext.state === 'suspended') {
+          console.log('Attempting to resume suspended AudioContext...');
+          await audioContext.resume();
+        }
+
+        if (audioContext.state === 'running') {
+          audioInitialized = true;
+          window.chromeAudioUnlocked = true;
+          console.log('Audio successfully initialized');
+          return true;
+        }
+
+        console.warn('AudioContext state:', audioContext.state);
+        return false;
+      } catch (error) {
+        console.error('Audio initialization failed:', error);
+        return false;
+      }
+    }
+
+    async function unlockAudioOnStart() {
+      if (window.chromeAudioUnlocked && audioInitialized) {
+        return true;
+      }
+
+      if (audioUnlockAttempts >= maxAudioUnlockAttempts) {
+        console.warn('Max audio unlock attempts reached');
+        return false;
+      }
+
+      audioUnlockAttempts++;
+      console.log(`Audio unlock attempt ${audioUnlockAttempts}/${maxAudioUnlockAttempts}`);
+
+      const success = await initAudio();
+      if (success) {
+        // Test audio functionality with a silent sound
+        try {
+          const testOsc = audioContext.createOscillator();
+          const testGain = audioContext.createGain();
+          testGain.gain.setValueAtTime(0, audioContext.currentTime);
+          testOsc.connect(testGain);
+          testGain.connect(audioContext.destination);
+          testOsc.start();
+          testOsc.stop(audioContext.currentTime + 0.001);
+          console.log('Audio test successful');
+        } catch (testError) {
+          console.warn('Audio test failed:', testError);
+          audioInitialized = false;
+          return false;
+        }
+      }
+
+      return success;
+    }
+
+    // Enhanced audio context validation
+    function ensureAudioReady() {
+      if (!audioContext || audioContext.state !== 'running' || !audioInitialized) {
+        console.warn('Audio not ready - Context state:', audioContext?.state, 'Initialized:', audioInitialized);
+        return false;
+      }
+      return true;
+    }
+
+    // Tempo-locked delay bus — 1/8 note at 120 BPM (0.25s), lowpass feedback.
+    // Single hits become rhythmic echoes; rapid play generates polyrhythm for free.
+    let delayBusInput = null;
+    function getDelayBus() {
+      if (delayBusInput) return delayBusInput;
+      try {
+        const delay = audioContext.createDelay(1.0);
+        delay.delayTime.value = 0.25;
+        const fb = audioContext.createGain();
+        fb.gain.value = 0.42;
+        const fbLp = audioContext.createBiquadFilter();
+        fbLp.type = 'lowpass';
+        fbLp.frequency.value = 2200;
+        const wet = audioContext.createGain();
+        wet.gain.value = 0.55;
+        delay.connect(fbLp);
+        fbLp.connect(fb);
+        fb.connect(delay);
+        delay.connect(wet);
+        wet.connect(audioContext.destination);
+        delayBusInput = delay;
+        return delayBusInput;
+      } catch (e) { return null; }
+    }
+
+    // Bounce combo state — successive bounces within COMBO_WINDOW step up
+    // the pentatonic scale from the wall's base index. Resets on silence.
+    const PENTATONIC_HZ = [164.81, 196.00, 220.00, 261.63, 293.66, 329.63, 392.00, 440.00, 523.25, 587.33];
+    const WALL_BASE_IDX = { bottom: 0, left: 2, right: 3, top: 5 };
+    const COMBO_WINDOW = 0.5;
+    let lastBounceAudioClockTime = -999;
+    let comboStep = 0;
+
+    // Shared reverb convolver for warmth
+    let reverbNode = null;
+    function getReverbNode() {
+      if (reverbNode) return reverbNode;
+      try {
+        const len = audioContext.sampleRate * 1.2;
+        const buf = audioContext.createBuffer(2, len, audioContext.sampleRate);
+        for (let c = 0; c < 2; c++) {
+          const d = buf.getChannelData(c);
+          for (let i = 0; i < len; i++) {
+            d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.5);
+          }
+        }
+        const conv = audioContext.createConvolver();
+        conv.buffer = buf;
+        const rvGain = audioContext.createGain();
+        rvGain.gain.value = 0.18;
+        conv.connect(rvGain);
+        rvGain.connect(audioContext.destination);
+        reverbNode = conv;
+        return reverbNode;
+      } catch (e) { return null; }
+    }
+
+    function connectWithPan(sourceNode, x, gainNode) {
+      // Pan based on x position, connect to destination (and optionally reverb)
+      const pan = (x / canvas.width) * 2 - 1;
+      let dest = audioContext.destination;
+      if (typeof audioContext.createStereoPanner === 'function') {
+        const panNode = audioContext.createStereoPanner();
+        panNode.pan.value = Math.max(-1, Math.min(1, pan));
+        gainNode.connect(panNode);
+        panNode.connect(audioContext.destination);
+        // Also send dry to reverb
+        const rv = getReverbNode();
+        if (rv) gainNode.connect(rv);
+      } else {
+        gainNode.connect(audioContext.destination);
+        const rv = getReverbNode();
+        if (rv) gainNode.connect(rv);
+      }
+    }
+
+    // Rich layered noise buffer helper
+    function makeNoiseBuffer(seconds, shapeFunc) {
+      const sr = audioContext.sampleRate;
+      const len = Math.floor(sr * seconds);
+      const buf = audioContext.createBuffer(1, len, sr);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < len; i++) {
+        const t = i / len;
+        d[i] = (Math.random() * 2 - 1) * (shapeFunc ? shapeFunc(t) : 1);
+      }
+      return buf;
+    }
+
+    async function playThud(side) {
+      if (!ensureAudioReady()) {
+        const success = await unlockAudioOnStart();
+        if (!success) return;
+      }
+      try {
+        const t = audioContext.currentTime;
+        const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+        const vol = isMobile ? 0.32 : 0.22;
+
+        // Soft low whump — slow pitch drop, gentle attack
+        const subOsc = audioContext.createOscillator();
+        const subGain = audioContext.createGain();
+        const subFilter = audioContext.createBiquadFilter();
+        subOsc.type = 'sine';
+        let baseFreq;
+        switch (side) {
+          case 'left': baseFreq = 52; break;
+          case 'right': baseFreq = 58; break;
+          case 'top': baseFreq = 62; break;
+          case 'bottom': baseFreq = 48; break;
+          default: baseFreq = 55;
+        }
+        subOsc.frequency.setValueAtTime(baseFreq * 1.35, t);
+        subOsc.frequency.exponentialRampToValueAtTime(baseFreq, t + 0.3);
+        subFilter.type = 'lowpass';
+        subFilter.frequency.setValueAtTime(100, t); // Hard ceiling at 100Hz — no audible pitch on mobile
+        subFilter.frequency.exponentialRampToValueAtTime(40, t + 0.8);
+        subGain.gain.setValueAtTime(0, t);
+        subGain.gain.linearRampToValueAtTime(vol, t + 0.03);
+        subGain.gain.exponentialRampToValueAtTime(0.001, t + 0.85);
+        subOsc.connect(subFilter);
+        subFilter.connect(subGain);
+        subGain.connect(audioContext.destination);
+        const rv = getReverbNode();
+        if (rv) subGain.connect(rv);
+        subOsc.start(t);
+        subOsc.stop(t + 0.9);
+
+        // Airy flame scatter — soft filtered noise breathes, doesnt bang
+        const noiseBuf = makeNoiseBuffer(0.7, v => (v < 0.06 ? v / 0.06 : 1) * Math.pow(1 - v, 2.5));
+        const noiseNode = audioContext.createBufferSource();
+        noiseNode.buffer = noiseBuf;
+        const nFilter = audioContext.createBiquadFilter();
+        nFilter.type = 'bandpass';
+        nFilter.frequency.setValueAtTime(350, t);
+        nFilter.frequency.exponentialRampToValueAtTime(120, t + 0.65);
+        nFilter.Q.setValueAtTime(0.4, t);
+        const nGain = audioContext.createGain();
+        nGain.gain.setValueAtTime(vol * 0.4, t);
+        nGain.gain.exponentialRampToValueAtTime(0.001, t + 0.65);
+        noiseNode.connect(nFilter);
+        nFilter.connect(nGain);
+        nGain.connect(audioContext.destination);
+        if (rv) nGain.connect(rv);
+        noiseNode.start(t);
+      } catch (error) {
+        console.error('Error playing thud sound:', error);
+      }
+    }
+
+    async function createMatchStrikeSound() {
+      if (!ensureAudioReady()) {
+        const success = await initAudio();
+        if (!success) return;
+      }
+      try {
+        const t = audioContext.currentTime;
+        const sr = audioContext.sampleRate;
+
+        // === Phase 1: Scratch/strike (0–0.12s) ===
+        const scratchLen = Math.floor(sr * 0.13);
+        const scratchBuf = audioContext.createBuffer(1, scratchLen, sr);
+        const sd = scratchBuf.getChannelData(0);
+        for (let i = 0; i < scratchLen; i++) {
+          const p = i / scratchLen;
+          // Rough textured noise with some crunch
+          const crunch = Math.sin(i * 0.3) * 0.3 + Math.sin(i * 0.7) * 0.2;
+          sd[i] = (Math.random() * 2 - 1 + crunch) * Math.pow(1 - p, 0.3) * (p < 0.1 ? p / 0.1 : 1);
+        }
+        const scratchSrc = audioContext.createBufferSource();
+        scratchSrc.buffer = scratchBuf;
+        const scratchHp = audioContext.createBiquadFilter();
+        scratchHp.type = 'highpass';
+        scratchHp.frequency.setValueAtTime(2500, t);
+        const scratchGain = audioContext.createGain();
+        scratchGain.gain.setValueAtTime(0.55, t);
+        scratchGain.gain.exponentialRampToValueAtTime(0.001, t + 0.13);
+        scratchSrc.connect(scratchHp);
+        scratchHp.connect(scratchGain);
+        scratchGain.connect(audioContext.destination);
+        scratchSrc.start(t);
+
+        // === Phase 2: Ignition pop + bloom (0.1s) ===
+        const popOsc = audioContext.createOscillator();
+        popOsc.type = 'sine';
+        popOsc.frequency.setValueAtTime(220, t + 0.08);
+        popOsc.frequency.exponentialRampToValueAtTime(60, t + 0.22);
+        const popGain = audioContext.createGain();
+        popGain.gain.setValueAtTime(0, t + 0.08);
+        popGain.gain.linearRampToValueAtTime(0.6, t + 0.11);
+        popGain.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+        popOsc.connect(popGain);
+        popGain.connect(audioContext.destination);
+        popOsc.start(t + 0.08);
+        popOsc.stop(t + 0.38);
+
+        // === Phase 3: Flame whoosh rising (0.1–1.2s) ===
+        const whooshLen = Math.floor(sr * 1.1);
+        const whooshBuf = audioContext.createBuffer(1, whooshLen, sr);
+        const wd = whooshBuf.getChannelData(0);
+        for (let i = 0; i < whooshLen; i++) {
+          const p = i / whooshLen;
+          wd[i] = (Math.random() * 2 - 1) * (p < 0.15 ? p / 0.15 : 1) * Math.pow(1 - p * 0.6, 0.8);
+        }
+        const whooshSrc = audioContext.createBufferSource();
+        whooshSrc.buffer = whooshBuf;
+        const whooshBp = audioContext.createBiquadFilter();
+        whooshBp.type = 'bandpass';
+        whooshBp.frequency.setValueAtTime(200, t + 0.1);
+        whooshBp.frequency.exponentialRampToValueAtTime(1200, t + 0.45);
+        whooshBp.frequency.exponentialRampToValueAtTime(600, t + 1.2);
+        whooshBp.Q.setValueAtTime(0.6, t + 0.1);
+        const whooshGain = audioContext.createGain();
+        whooshGain.gain.setValueAtTime(0, t + 0.1);
+        whooshGain.gain.linearRampToValueAtTime(0.7, t + 0.35);
+        whooshGain.gain.exponentialRampToValueAtTime(0.25, t + 1.0);
+        whooshGain.gain.exponentialRampToValueAtTime(0.001, t + 1.25);
+        whooshSrc.connect(whooshBp);
+        whooshBp.connect(whooshGain);
+        whooshGain.connect(audioContext.destination);
+        const rv = getReverbNode();
+        if (rv) whooshGain.connect(rv);
+        whooshSrc.start(t + 0.1);
+
+        // === Phase 4: Sub bass body thump ===
+        const bodyOsc = audioContext.createOscillator();
+        bodyOsc.type = 'sine';
+        bodyOsc.frequency.setValueAtTime(80, t + 0.09);
+        bodyOsc.frequency.exponentialRampToValueAtTime(40, t + 0.4);
+        const bodyGain = audioContext.createGain();
+        bodyGain.gain.setValueAtTime(0, t + 0.09);
+        bodyGain.gain.linearRampToValueAtTime(0.5, t + 0.14);
+        bodyGain.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+        bodyOsc.connect(bodyGain);
+        bodyGain.connect(audioContext.destination);
+        bodyOsc.start(t + 0.09);
+        bodyOsc.stop(t + 0.52);
+
+      } catch (error) {
+        console.error('Error playing match strike sound:', error);
+      }
+    }
+
+    // Flame whoosh for tap/touch — no sound on hold (spirals handle their own sizzle)
+    async function createElectronicSound(x, y, isHold = false) {
+      if (isHold) return; // holding sound removed — spirals sizzle instead
+      if (!ensureAudioReady()) {
+        const success = await unlockAudioOnStart();
+        if (!success) return;
+      }
+      try {
+        const t = audioContext.currentTime;
+
+        // Tap "ignite" — short pentatonic bell arpeggio, pitch picked by y.
+        // Noise puff + sawtooth crackle removed: they clashed with the pluck-
+        // roll / bell identity shared by hold and bounce sizzles.
+        const scale = PENTATONIC_HZ;
+        const norm = 1 - (y / canvas.height);
+        const rootIdx = Math.max(0, Math.min(scale.length - 4,
+          Math.floor(norm * (scale.length - 4))));
+        const arpOffsets = [0, 2, 4];
+        const arpGap = 0.055;
+        const pan = (x / canvas.width) * 2 - 1;
+        const tapPan = typeof audioContext.createStereoPanner === 'function'
+          ? audioContext.createStereoPanner() : null;
+        if (tapPan) tapPan.pan.value = Math.max(-1, Math.min(1, pan));
+        const rv = getReverbNode();
+
+        for (let i = 0; i < arpOffsets.length; i++) {
+          const when = t + i * arpGap;
+          const hz = scale[Math.min(scale.length - 1, rootIdx + arpOffsets[i])]
+                   * (1 + (Math.random() - 0.5) * 0.004);
+          const carrier = audioContext.createOscillator();
+          carrier.type = 'sine';
+          carrier.frequency.setValueAtTime(hz, when);
+          const mod = audioContext.createOscillator();
+          mod.type = 'sine';
+          mod.frequency.setValueAtTime(hz * 3, when);
+          const modDepth = audioContext.createGain();
+          modDepth.gain.setValueAtTime(hz * 2, when);
+          modDepth.gain.exponentialRampToValueAtTime(0.01, when + 0.1);
+          mod.connect(modDepth);
+          modDepth.connect(carrier.frequency);
+          const g = audioContext.createGain();
+          const peak = 0.38 - i * 0.06;
+          g.gain.setValueAtTime(0, when);
+          g.gain.linearRampToValueAtTime(peak, when + 0.004);
+          g.gain.exponentialRampToValueAtTime(0.0001, when + 0.35);
+          carrier.connect(g);
+          if (tapPan) {
+            g.connect(tapPan);
+          } else {
+            g.connect(audioContext.destination);
+          }
+          if (rv) g.connect(rv);
+          carrier.start(when);
+          mod.start(when);
+          carrier.stop(when + 0.45);
+          mod.stop(when + 0.45);
+        }
+        if (tapPan) tapPan.connect(audioContext.destination);
+      } catch (error) {
+        console.error('Error playing tap sound:', error);
+      }
+    }
+
+    // SnakeSpiral from flamethrower6
+    class SnakeSpiral {
+      constructor(x, y, isHold = false, speed = 0, silent = false, side = null) {
+        this.x = x;
+        this.y = y;
+        this.points = [];
+        this.maxPoints = isHold ? Math.floor(70 + speed * 4) : Math.floor(50 + speed * 2);
+        this.segmentLength = isHold ? 35 + speed : 25 + speed * 1.2;
+        this.angle = Math.random() * Math.PI * 2;
+        this.angleSpeed = (Math.random() * 0.3 + 0.15) * (isHold ? 2.5 : 2) * (Math.random() < 0.5 ? 1 : -1);
+        this.hue = Math.random() * 50 + 10;
+        this.opacity = 1;
+        this.age = 0;
+        this.isHold = isHold;
+        this.fadeRate = 0.008;
+        this.radius = isHold ? 45 + speed * 2.5 : 30 + speed * 1.5;
+        this.points.push({ x, y, angle: this.angle });
+        this.initialSpeed = speed;
+        this.flickerRate = Math.random() * 0.3 + 0.15;
+        this.spreadFactor = Math.random() * 0.5 + 0.4;
+        this.side = side;
+        // Sizzle audio nodes for this spiral
+        this.sizzleGain = null;
+        this.sizzleSrc = null;
+        this.sizzleSrc2 = null;
+        if (!silent) {
+          this._startSizzle(x, y, isHold, speed, side);
+        }
+      }
+
+      _startSizzle(x, y, isHold, speed, side) {
+        if (!audioInitialized || !audioContext || audioContext.state !== 'running') return;
+        // Bounce sizzles take a completely separate one-shot path:
+        // independent noise buffer per bounce, baked envelope, direct to destination.
+        // No looping, no shared compressor, no eviction tracking — self-terminating.
+        if (!isHold) { this._startBounceSizzle(x, y, speed, side); return; }
+        // Evict oldest sizzle if at capacity (hold/interaction sizzles only)
+        while (activeSizzleSpirals.length >= MAX_CONCURRENT_SIZZLES) {
+          const oldest = activeSizzleSpirals.shift();
+          if (oldest && oldest.sizzleGain) oldest._stopSizzle();
+        }
+        // --- FUNDAMENTAL REDESIGN: hold sizzle as continuous pluck roll ---
+        // Noise is gone entirely. The hold identity is now a JS-scheduled
+        // arpeggiator cycling a pentatonic motif at a tempo-adjacent rate,
+        // plus a quiet low sine drone at the scale root for body. Pitch
+        // tracks the spiral's tip y-position live, so dragging transposes
+        // the pattern. Same masterGain / pan / opacity-fade plumbing as
+        // before — update() still drives sizzleGain from opacity each frame.
+        try {
+          const t = audioContext.currentTime;
+
+          const masterGain = audioContext.createGain();
+          const baseVol = 0.26;
+          masterGain.gain.setValueAtTime(0, t);
+          masterGain.gain.linearRampToValueAtTime(baseVol, t + 0.12);
+
+          // Bypass the shared sizzle compressor for the new pluck-roll hold:
+          // the compressor's fast attack on the first pluck produced an audible
+          // "static as the needle lifts" artifact at every touch-down. The
+          // pluck roll has no noise-correlation loudness-spike risk, so it
+          // doesn't need the compressor's protection.
+          let panNode = null;
+          if (typeof audioContext.createStereoPanner === 'function') {
+            panNode = audioContext.createStereoPanner();
+            panNode.pan.value = Math.max(-1, Math.min(1, (x / canvas.width) * 2 - 1));
+            masterGain.connect(panNode);
+            panNode.connect(audioContext.destination);
+          } else {
+            masterGain.connect(audioContext.destination);
+          }
+          const rv = getReverbNode();
+          if (rv) masterGain.connect(rv);
+
+          // Tempo-locked delay send — hold rolls feed echoes too
+          const delayBus = getDelayBus();
+          if (delayBus) {
+            const ds = audioContext.createGain();
+            ds.gain.value = 0.24;
+            masterGain.connect(ds);
+            ds.connect(delayBus);
+          }
+
+          // Scale root picked from initial y (inverted — top of canvas = higher).
+          const rootIdxFromY = (yy) => {
+            const norm = 1 - (yy / canvas.height);
+            return Math.max(0, Math.min(PENTATONIC_HZ.length - 5,
+              Math.floor(norm * (PENTATONIC_HZ.length - 5))));
+          };
+
+          // Deep-whine sub drone removed at user request — the slow-LFO low
+          // sine at root/2 was reading as an intrusive hum on hold. The pluck
+          // roll itself now carries the hold sound with no sustained low layer.
+          const subOsc = null, subGain2 = null, lfo = null;
+
+          // Arpeggiator pattern — offsets into PENTATONIC_HZ relative to root.
+          // Asymmetric motif reads as "played" rather than mechanical.
+          const PATTERN = [0, 2, 4, 1, 3, 2, 4, 3, 2, 0, 1, 3];
+          const arpRate = 0.11; // seconds between plucks
+          let nextTime = t + 0.05;
+          let patIdx = 0;
+          const spiral = this;
+
+          const arpTick = () => {
+            // Bail if the spiral has been stopped
+            if (!spiral.sizzleGain) return;
+            const ahead = audioContext.currentTime + 0.28;
+            while (nextTime < ahead) {
+              const tip = spiral.points[0];
+              const tipY = tip ? tip.y : y;
+              const rootIdx = rootIdxFromY(tipY);
+              const scaleIdx = Math.min(PENTATONIC_HZ.length - 1,
+                rootIdx + PATTERN[patIdx % PATTERN.length]);
+              const hz = PENTATONIC_HZ[scaleIdx] * (1 + (Math.random() - 0.5) * 0.004);
+
+              const o = audioContext.createOscillator();
+              o.type = 'triangle';
+              o.frequency.setValueAtTime(hz, nextTime);
+              const lp = audioContext.createBiquadFilter();
+              lp.type = 'lowpass';
+              lp.frequency.setValueAtTime(Math.min(5500, hz * 5 + 700), nextTime);
+              lp.Q.setValueAtTime(0.85, nextTime);
+              const g = audioContext.createGain();
+              // Accent every 4th note
+              const peak = (patIdx % 4 === 0) ? 0.5 : 0.32;
+              g.gain.setValueAtTime(0, nextTime);
+              g.gain.linearRampToValueAtTime(peak, nextTime + 0.003);
+              g.gain.exponentialRampToValueAtTime(0.0001, nextTime + 0.22);
+              o.connect(lp);
+              lp.connect(g);
+              g.connect(masterGain);
+              o.start(nextTime);
+              o.stop(nextTime + 0.28);
+
+              nextTime += arpRate;
+              patIdx++;
+            }
+          };
+          arpTick();
+          const arpTimer = setInterval(arpTick, 80);
+
+          this.sizzleGain = masterGain;
+          this.sizzleBaseVol = baseVol;
+          this.sizzleSrc = null;
+          this.sizzleSrc2 = null;
+          this.sizzlePan = panNode;
+          this.sizzleSubOsc = subOsc;
+          this.sizzleSubGain = subGain2;
+          this.sizzleLfo = lfo;
+          // Legacy tone fields null so update()'s retune block is inert for the
+          // new roll-based hold sizzle (retuning happens inside arpTick instead).
+          this.sizzleToneGain = null;
+          this.sizzleToneBaseVol = 0;
+          this.sizzleToneOsc = null;
+          this.sizzleToneOsc2 = null;
+          this.holdArpTimer = arpTimer;
+          activeSizzleSpirals.push(this);
+        } catch (e) { }
+      }
+
+      // Sizzle redesign (applied edits: 1 + 2 + 3 + 4, per SIZZLE_REDESIGN_SPEC.md):
+      //   Edit 1: wall `side` plumbed through for per-wall pitch identity.
+      //   Edit 2: transient attack layer — highpassed noise burst from a DIFFERENT
+      //           pool buffer than the body, so concurrent bounces don't correlate.
+      //           Routed dry (bypassing masterGain) to avoid reverb smearing the
+      //           attack, per the spec's "do not reverb the transient" directive.
+      //   Edit 3: speed-keyed presets (wet / dry / ember) replacing hardcoded body
+      //           parameters; "ember" adds a second delayed transient burst sharing
+      //           the same highpass node to save an allocation.
+      //   Edit 4: per-wall sine oscillator (220/247/330/165 Hz for L/R/T/B) with a
+      //           ~150 ms envelope, routed through masterGain so it inherits the
+      //           opacity fade like the body. ±5 cents randomization per hit.
+      // Parameter tuning past the spec defaults (in response to user feedback that
+      // the initial transient was too sharp/clicky):
+      //   - preset.hpFreq lowered: wet 2000→1000, dry 3000→1500, ember 3000→1500
+      //   - transient attack time 2ms → 6ms (less clicky edge)
+      //   - transient decay stretched 18ms → 25ms (more natural settle)
+      //   - first-burst peak 1.5*baseVol → 0.9*baseVol
+      //   - ember second-burst peak 1.1*baseVol → 0.7*baseVol
+      // Transient burst survives past _stopSizzle because it's scheduled to stop
+      // at t+0.05 in the audio clock.
+      _startBounceSizzle(x, y, speed, side) {
+        try {
+          const t = audioContext.currentTime;
+          const pool = getBounceNoisePool();
+          if (!pool || pool.length === 0) return;
+
+          // Track bufIdx so the transient layer can pick a DIFFERENT buffer
+          // (avoids correlated-noise summing loudness spikes).
+          const bufIdx = Math.floor(Math.random() * pool.length);
+          const buf = pool[bufIdx];
+          const src = audioContext.createBufferSource();
+          src.buffer = buf;
+          src.loop = true; // loop so the sizzle can follow the spiral's full lifetime
+          src.loopStart = 0;
+          src.loopEnd = buf.duration;
+          src.playbackRate.value = 0.92 + Math.random() * 0.18;
+
+          // --- Edit 3: speed-keyed preset ---
+          let preset;
+          if (speed < 5) {
+            // hpFreq lowered (2000→1000) to tame the sharp top-end click reported by the user.
+            preset = { name: 'wet', bpCenter: 350, bpRand: 100, hsGain: 3, hpFreq: 1000, doubleTransient: false };
+          } else if (speed < 10) {
+            // hpFreq lowered (3000→1500) for the same reason.
+            preset = { name: 'dry', bpCenter: 600, bpRand: 300, hsGain: 5, hpFreq: 1500, doubleTransient: false };
+          } else {
+            preset = { name: 'ember', bpCenter: 850, bpRand: 300, hsGain: 7, hpFreq: 1500, doubleTransient: true };
+          }
+          // Preset sets the center; ±20% randomization gives per-bounce variety.
+          const bpCenterFreq = (preset.bpCenter + Math.random() * preset.bpRand) * (0.8 + Math.random() * 0.4);
+          const hsGainDb = preset.hsGain * (0.8 + Math.random() * 0.4);
+
+          // --- FUNDAMENTAL REDESIGN: pluck cascade body (option B + A ghost) ---
+          // The noise-based sizzle body (bandpass + highshelf filtered noise) has
+          // been removed entirely. A bounce is now a short arpeggio of plucked
+          // tones climbing the pentatonic scale — a "kalimba roll" — with a very
+          // quiet layer of high granular shimmer underneath for texture.
+          // `src`/`bufIdx`/`bp`/`hs` nodes above are now unused but left intact
+          // to avoid disturbing the pool-picking logic; `src.start` is never
+          // called, so they self-GC.
+          const lenFactor = this.maxPoints / 50;
+          const baseVol = Math.min(0.6, (0.2 + speed * 0.009) * lenFactor);
+          const masterGain = audioContext.createGain();
+          masterGain.gain.setValueAtTime(baseVol, t);
+
+          let panNode = null;
+          let tail = masterGain;
+          if (typeof audioContext.createStereoPanner === 'function') {
+            panNode = audioContext.createStereoPanner();
+            panNode.pan.value = Math.max(-1, Math.min(1, (x / canvas.width) * 2 - 1));
+            masterGain.connect(panNode);
+            tail = panNode;
+          }
+          tail.connect(audioContext.destination);
+          const rv = getReverbNode();
+          if (rv) masterGain.connect(rv);
+
+          // Delay send for rhythmic echoes (the cascade feeds the tempo-locked bus)
+          const delayBus = getDelayBus();
+          let delaySend = null;
+          if (delayBus) {
+            delaySend = audioContext.createGain();
+            delaySend.gain.value = 0.32;
+            masterGain.connect(delaySend);
+            delaySend.connect(delayBus);
+          }
+
+          // Combo stepping sets the *starting* scale degree of the cascade.
+          // Within COMBO_WINDOW the next bounce starts higher up the scale.
+          if (t - lastBounceAudioClockTime > COMBO_WINDOW) {
+            comboStep = 0;
+          } else {
+            comboStep = Math.min(comboStep + 1, 4);
+          }
+          lastBounceAudioClockTime = t;
+          const baseIdx = WALL_BASE_IDX[side] !== undefined ? WALL_BASE_IDX[side] : 2;
+          const startIdx = Math.min(PENTATONIC_HZ.length - 1, baseIdx + comboStep);
+
+          // Bounce voice: FM bell (2-op, 3:1 carrier:modulator) with a fast
+          // mod-index decay. Bright metallic ping — clearly distinct from the
+          // soft triangle plucks used in the hold roll.
+          const spawnBell = (noteHz, when, peak) => {
+            const carrier = audioContext.createOscillator();
+            carrier.type = 'sine';
+            carrier.frequency.setValueAtTime(noteHz, when);
+            const mod = audioContext.createOscillator();
+            mod.type = 'sine';
+            mod.frequency.setValueAtTime(noteHz * 3, when);
+            const modDepth = audioContext.createGain();
+            modDepth.gain.setValueAtTime(noteHz * 2.2, when);
+            modDepth.gain.exponentialRampToValueAtTime(0.01, when + 0.12);
+            mod.connect(modDepth);
+            modDepth.connect(carrier.frequency);
+            const g = audioContext.createGain();
+            g.gain.setValueAtTime(0, when);
+            g.gain.linearRampToValueAtTime(peak, when + 0.004);
+            g.gain.exponentialRampToValueAtTime(0.0001, when + 0.35);
+            carrier.connect(g);
+            g.connect(masterGain);
+            carrier.start(when);
+            mod.start(when);
+            carrier.stop(when + 0.45);
+            mod.stop(when + 0.45);
+          };
+
+          // Scheduled bell roll — runs for the spiral's full lifetime, not a
+          // one-shot cascade. Pitch climbs the pentatonic from startIdx,
+          // wrapping back down after the peak so a long spiral sings a full
+          // arc. Per-tick gain scales with spiral.opacity so the roll tapers
+          // with the visual fade naturally.
+          const BOUNCE_PATTERN = [0, 2, 4, 6, 4, 3, 5, 7, 5, 4, 2, 1];
+          const bounceArpRate = 0.085;
+          let bNextTime = t;
+          let bPatIdx = 0;
+          const spiral = this;
+          const bounceTick = () => {
+            if (!spiral.sizzleGain || spiral.opacity <= 0) return;
+            const ahead = audioContext.currentTime + 0.25;
+            while (bNextTime < ahead) {
+              const offset = BOUNCE_PATTERN[bPatIdx % BOUNCE_PATTERN.length];
+              const idx = Math.min(PENTATONIC_HZ.length - 1, startIdx + offset);
+              const hz = PENTATONIC_HZ[idx] * (1 + (Math.random() - 0.5) * 0.004);
+              // Opacity at scheduling time — masterGain rides visual fade,
+              // but scaling the per-bell peak too prevents late-life bells
+              // from overshooting as the fade steepens.
+              const op = Math.max(0.15, spiral.opacity);
+              const peak = baseVol * (0.9 * op) * (bPatIdx % 4 === 0 ? 1.1 : 0.85);
+              spawnBell(hz, bNextTime, Math.max(0.1, peak));
+
+              // Sparse high-octave shimmer grain (ghost A layer) every few bells
+              if (bPatIdx % 3 === 1) {
+                const gHz = PENTATONIC_HZ[Math.min(PENTATONIC_HZ.length - 1, idx + 3)] * 2;
+                const osc = audioContext.createOscillator();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(gHz, bNextTime);
+                const gg = audioContext.createGain();
+                gg.gain.setValueAtTime(0, bNextTime);
+                gg.gain.linearRampToValueAtTime(baseVol * 0.15 * op, bNextTime + 0.004);
+                gg.gain.exponentialRampToValueAtTime(0.0001, bNextTime + 0.05);
+                osc.connect(gg);
+                gg.connect(masterGain);
+                osc.start(bNextTime);
+                osc.stop(bNextTime + 0.07);
+              }
+
+              bNextTime += bounceArpRate;
+              bPatIdx++;
+            }
+          };
+          bounceTick();
+          const bounceArpTimer = setInterval(bounceTick, 80);
+          // Reuse the holdArpTimer field so _stopSizzle's clearInterval picks
+          // it up when the spiral fades (opacity → 0 triggers _stopSizzle).
+          this.holdArpTimer = bounceArpTimer;
+
+          this.sizzleGain = masterGain;
+          this.sizzleBaseVol = baseVol;
+          this.sizzleSrc = null;
+          this.sizzleSrc2 = null;
+          this.sizzlePan = panNode;
+          // NOT pushed to activeSizzleSpirals: bounces self-terminate when the
+          // spiral's opacity hits zero, so eviction tracking isn't needed.
+          // Transient + pitch nodes are self-terminating via their scheduled stop()
+          // calls — no cleanup tracking needed on `this`.
+        } catch (e) { }
+      }
+
+      _stopSizzle() {
+        const idx = activeSizzleSpirals.indexOf(this);
+        if (idx !== -1) activeSizzleSpirals.splice(idx, 1);
+        if (this.holdArpTimer) {
+          clearInterval(this.holdArpTimer);
+          this.holdArpTimer = null;
+        }
+        if (!this.sizzleGain) return;
+        try {
+          const t = audioContext.currentTime;
+          const fadeDur = isMobile ? 0.25 : 1.5;
+          const toneFadeDur = isMobile ? 0.3 : 2.0;
+          this.sizzleGain.gain.setValueAtTime(this.sizzleGain.gain.value, t);
+          this.sizzleGain.gain.exponentialRampToValueAtTime(0.0001, t + fadeDur);
+          if (this.sizzleToneGain) {
+            this.sizzleToneGain.gain.setValueAtTime(this.sizzleToneGain.gain.value, t);
+            this.sizzleToneGain.gain.exponentialRampToValueAtTime(0.0001, t + toneFadeDur);
+          }
+          const s1 = this.sizzleSrc, s2 = this.sizzleSrc2;
+          const to1 = this.sizzleToneOsc, to2 = this.sizzleToneOsc2, lfo = this.sizzleLfo;
+          const subO = this.sizzleSubOsc;
+          this.sizzleGain = null; this.sizzleSrc = null; this.sizzleSrc2 = null;
+          this.sizzlePan = null; this.sizzleToneGain = null;
+          this.sizzleToneOsc = null; this.sizzleToneOsc2 = null; this.sizzleLfo = null;
+          this.sizzleSubOsc = null; this.sizzleSubGain = null;
+          setTimeout(() => {
+            try {
+              s1.stop(); s2.stop();
+              if (to1) to1.stop();
+              if (to2) to2.stop();
+              if (lfo) lfo.stop();
+              if (subO) subO.stop();
+            } catch (e) { }
+          }, isMobile ? 400 : 2200);
+        } catch (e) { }
+      }
+
+      update() {
+        this.age++;
+        const dt = dtScale;
+        if (this.isHold && isHolding) {
+          const dx = currentX - this.points[0].x;
+          const dy = currentY - this.points[0].y;
+          this.points[0].x += dx * 0.1 * dt;
+          this.points[0].y += dy * 0.1 * dt;
+          this.angle = Math.atan2(dy, dx);
+        } else {
+          this.angle += this.angleSpeed * (1 + Math.sin(this.age * this.flickerRate) * 0.8) * dt;
+          const speed = this.isHold ? 12 + this.initialSpeed * 0.8 : 9 + this.initialSpeed * 0.5;
+          let newX = this.points[0].x + Math.cos(this.angle) * speed * (1 + Math.sin(this.age * 0.1) * this.spreadFactor) * dt;
+          let newY = this.points[0].y + Math.sin(this.angle) * speed * (1 + Math.cos(this.age * 0.1) * this.spreadFactor) * dt - 1.5 * dt;
+          if (newX < 0) { newX = 0; this.angle = Math.PI - this.angle; }
+          else if (newX > canvas.width) { newX = canvas.width; this.angle = Math.PI - this.angle; }
+          if (newY < 0) { newY = 0; this.angle = -this.angle; }
+          else if (newY > canvas.height) { newY = canvas.height; this.angle = -this.angle; }
+          this.points[0].x = newX;
+          this.points[0].y = newY;
+          if (Math.random() < 0.3) { particles.push(new Particle(this.points[0].x, this.points[0].y, true)); }
+        }
+        for (let i = 1; i < this.points.length; i++) {
+          const dx = this.points[i - 1].x - this.points[i].x;
+          const dy = this.points[i - 1].y - this.points[i].y;
+          this.points[i].x += dx * 0.25;
+          this.points[i].y += dy * 0.25;
+        }
+        if (this.points.length < this.maxPoints && this.age % 2 === 0) {
+          this.points.push({ ...this.points[this.points.length - 1] });
+        }
+        if (!this.isHold || !isHolding) { this.opacity -= this.fadeRate; }
+        // Track sizzle + tone to tip position and opacity every frame
+        if (audioContext && audioContext.state === 'running') {
+          const tip = this.points[0];
+          const ct = audioContext.currentTime;
+          const tipPan = Math.max(-1, Math.min(1, (tip.x / canvas.width) * 2 - 1));
+
+          // Update pan to follow tip
+          if (this.sizzlePan) {
+            try { this.sizzlePan.pan.setTargetAtTime(tipPan, ct, 0.04); } catch (e) { }
+          }
+
+          // Update sizzle volume with opacity
+          if (this.sizzleGain) {
+            try {
+              const targetVol = this.opacity > 0 ? this.sizzleBaseVol * this.opacity : 0.0001;
+              this.sizzleGain.gain.setTargetAtTime(Math.max(0.0001, targetVol), ct, 0.06);
+            } catch (e) { }
+          }
+
+          // Update tone: retune to current Y position, track opacity (hold/interaction only)
+          if (this.isHold && this.sizzleToneOsc && this.sizzleToneOsc2) {
+            try {
+              const scaleHz = [32.70, 36.71, 41.20, 43.65, 49.00,
+                55.00, 61.74, 65.41, 73.42, 82.41,
+                87.31, 92.50, 98.00];
+              const si = Math.floor((tip.y / canvas.height) * (scaleHz.length - 1));
+              const nf = scaleHz[Math.max(0, Math.min(scaleHz.length - 1, si))];
+              // Glide tone smoothly toward new note
+              this.sizzleToneOsc.frequency.setTargetAtTime(nf, ct, 0.12);
+              this.sizzleToneOsc2.frequency.setTargetAtTime(nf * 1.5, ct, 0.12);
+            } catch (e) { }
+          }
+          if (this.sizzleToneGain) {
+            try {
+              const tVol = this.opacity > 0 ? this.sizzleToneBaseVol * this.opacity : 0.0001;
+              this.sizzleToneGain.gain.setTargetAtTime(Math.max(0.0001, tVol), ct, 0.06);
+            } catch (e) { }
+          }
+        }
+        if (Math.random() < 0.5) {
+          particles.push(new Particle(this.points[0].x + (Math.random() - 0.5) * 20, this.points[0].y + (Math.random() - 0.5) * 20));
+        }
+        const alive = this.opacity > 0;
+        if (!alive) this._stopSizzle();
+        return alive;
+      }
+      draw() {
+        if (this.points.length < 2) return;
+        ctx.beginPath();
+        ctx.moveTo(this.points[0].x, this.points[0].y);
+        const width = this.isHold ? 28 + this.initialSpeed : 15 + this.initialSpeed * 0.8;
+        const hueShift = this.hue + Math.sin(this.age * 0.2) * 15;
+        ctx.lineWidth = width;
+        ctx.lineCap = 'round';
+        for (let i = 1; i < this.points.length; i++) {
+          const t = i / (this.points.length - 1);
+          const intensity = Math.sin(t * Math.PI) * 0.5 + 0.5;
+          ctx.strokeStyle = `hsla(${hueShift - t * 30}, ${100 - t * 20}%, ${50 + t * 25}%, ${this.opacity * (1 - t * 0.3) * intensity})`;
+          ctx.beginPath();
+          ctx.moveTo(this.points[i - 1].x, this.points[i - 1].y);
+          ctx.lineTo(this.points[i].x, this.points[i].y);
+          ctx.stroke();
+        }
+        const head = this.points[0];
+        ctx.beginPath();
+        const gradient = ctx.createRadialGradient(head.x, head.y, 0, head.x, head.y, width * 3);
+        gradient.addColorStop(0, `hsla(${hueShift}, 100%, 60%, ${this.opacity * 0.8})`);
+        gradient.addColorStop(0.5, `hsla(${hueShift - 20}, 100%, 50%, ${this.opacity * 0.4})`);
+        gradient.addColorStop(1, `hsla(${hueShift - 40}, 100%, 40%, 0)`);
+        ctx.fillStyle = gradient;
+        ctx.arc(head.x, head.y, width * 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      checkCollision(x, y) {
+        const head = this.points[0];
+        const dx = x - head.x;
+        const dy = y - head.y;
+        return Math.sqrt(dx * dx + dy * dy) < this.radius;
+      }
+    }
+
+    // Spawn multiple spirals on wall impact (richer bursts)
+    // One spiral gets the crispy wall-sizzle audio; rest are silent visuals.
+    // Cooldown prevents stacking when bounces happen in quick succession.
+    function spawnImpactSpirals(x, y, speed, side) {
+      const now = performance.now();
+      const audioAllowed = (now - lastBounceAudioTime) >= BOUNCE_AUDIO_COOLDOWN;
+      if (audioAllowed) lastBounceAudioTime = now;
+      const count = Math.min(6, 2 + Math.floor(speed / 2));
+      for (let i = 0; i < count; i++) {
+        const asHold = (i === 0);
+        if (i === 0 && audioAllowed) {
+          // Dedicated wall-sizzle spiral: isHold=false so it gets the crispy
+          // bandpass crackle sound, not the muffled hold/interaction sound.
+          // `side` carries wall identity for Edit 4's per-wall pitch.
+          const s = new SnakeSpiral(x, y, false, speed * (0.85 + Math.random() * 0.5), false, side);
+          spirals.push(s);
+        } else {
+          // Visual-only spiral (silent) — side not needed.
+          const s = new SnakeSpiral(x, y, asHold, speed * (0.85 + Math.random() * 0.5), true);
+          spirals.push(s);
+        }
+      }
+    }
+
+    function updateBall() {
+      const dt = dtScale;
+      if (isHolding) {
+        const dx = currentX - ball.x;
+        const dy = currentY - ball.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        if (distance > 0) {
+          ball.vx += (dx / distance) * ball.attraction * dt;
+          ball.vy += (dy / distance) * ball.attraction * dt;
+        }
+      }
+      ball.x += ball.vx * dt;
+      ball.y += ball.vy * dt;
+      ball.rotation += ball.rotationSpeed * dt;
+      ball.rotationSpeed *= Math.pow(ball.rotationDamping, dt);
+      if (ballAnimationActive) {
+        const dpr = window.devicePixelRatio || 1;
+        const perFrame = dpr > 1 ? 2 : 3;
+        for (let i = 0; i < perFrame; i++) {
+          particles.push(new Particle(ball.x + (Math.random() - 0.5) * ball.radius * 0.8, ball.y + ball.radius * 0.6));
+        }
+      }
+      particles = particles.filter(p => p.update());
+      const speedNow = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+      if (speedNow > ball.maxSpeed) {
+        ball.vx = (ball.vx / speedNow) * ball.maxSpeed;
+        ball.vy = (ball.vy / speedNow) * ball.maxSpeed;
+      }
+      if (ball.x < ball.radius) {
+        const s = Math.abs(ball.vx);
+        const impactAngle = Math.atan2(ball.vy, -ball.vx);
+        ball.vx *= -0.8;
+        ball.x = ball.radius;
+        ball.rotationSpeed += Math.sin(impactAngle) * s * ball.spinFactor;
+        if (!wallContact.left) {
+          playThud('left');
+          if (ballAnimationActive) { spawnImpactSpirals(ball.x, ball.y, s, 'left'); }
+          wallContact.left = true;
+        }
+      } else if (ball.x > canvas.width - ball.radius) {
+        const s = Math.abs(ball.vx);
+        const impactAngle = Math.atan2(ball.vy, ball.vx);
+        ball.vx *= -0.8;
+        ball.x = canvas.width - ball.radius;
+        ball.rotationSpeed += Math.sin(impactAngle) * s * ball.spinFactor;
+        if (!wallContact.right) {
+          playThud('right');
+          if (ballAnimationActive) { spawnImpactSpirals(ball.x, ball.y, s, 'right'); }
+          wallContact.right = true;
+        }
+      }
+      if (ball.y < ball.radius) {
+        const s = Math.abs(ball.vy);
+        const impactAngle = Math.atan2(-ball.vy, ball.vx);
+        ball.vy *= -0.8;
+        ball.y = ball.radius;
+        ball.rotationSpeed += Math.sin(impactAngle) * s * ball.spinFactor;
+        if (!wallContact.top) {
+          playThud('top');
+          if (ballAnimationActive) { spawnImpactSpirals(ball.x, ball.y, s, 'top'); }
+          wallContact.top = true;
+        }
+      } else if (ball.y > canvas.height - ball.radius) {
+        const s = Math.abs(ball.vy);
+        const impactAngle = Math.atan2(ball.vy, ball.vx);
+        ball.vy *= -0.8;
+        ball.y = canvas.height - ball.radius;
+        ball.rotationSpeed += Math.sin(impactAngle) * s * ball.spinFactor;
+        if (!wallContact.bottom) {
+          playThud('bottom');
+          if (ballAnimationActive) { spawnImpactSpirals(ball.x, ball.y, s, 'bottom'); }
+          wallContact.bottom = true;
+        }
+      }
+      if (ball.x > ball.radius + 2) wallContact.left = false;
+      if (ball.x < canvas.width - ball.radius - 2) wallContact.right = false;
+      if (ball.y > ball.radius + 2) wallContact.top = false;
+      if (ball.y < canvas.height - ball.radius - 2) wallContact.bottom = false;
+    }
+
+    function drawBall() {
+      if (!showBall) return;
+      ctx.save();
+      ctx.translate(ball.x, ball.y);
+      ctx.rotate(ball.rotation);
+      const dpr = window.devicePixelRatio || 1;
+
+      heatPulse += 0.04 * heatPulseDirection;
+      if (heatPulse >= 1) { heatPulseDirection = -1; }
+      if (heatPulse <= 0) { heatPulseDirection = 1; }
+      const p = 0.8 + 0.2 * Math.sin(heatPulse * Math.PI); // Smooth pulsation
+
+      if (!ballAnimationActive) {
+        // Dormant state - a dark ember
+        ctx.beginPath();
+        ctx.fillStyle = '#110500';
+        ctx.arc(0, 0, ball.radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#441100';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.restore();
+        return;
+      }
+
+      ctx.globalCompositeOperation = 'lighter';
+
+      // Outer ambient glow
+      const auraR = ball.radius * 3.5;
+      const aura = ctx.createRadialGradient(0, 0, 0, 0, 0, auraR);
+      aura.addColorStop(0, `rgba(255, 80, 0, ${0.3 * p})`);
+      aura.addColorStop(0.4, `rgba(150, 20, 0, ${0.1 * p})`);
+      aura.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      ctx.beginPath();
+      ctx.fillStyle = aura;
+      ctx.arc(0, 0, auraR, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Main fireball body
+      const bodyR = ball.radius * 1.8;
+      const bodyGlow = ctx.createRadialGradient(0, 0, 0, 0, 0, bodyR);
+      bodyGlow.addColorStop(0, `rgba(255, 140, 0, ${0.7 * p})`);
+      bodyGlow.addColorStop(0.5, `rgba(220, 50, 0, ${0.4 * p})`);
+      bodyGlow.addColorStop(1, 'rgba(100, 0, 0, 0)');
+      ctx.beginPath();
+      ctx.fillStyle = bodyGlow;
+      ctx.arc(0, 0, bodyR, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Dynamic flame tongues/flares
+      const numFlares = 10;
+      const time = Date.now() * 0.004;
+      for (let i = 0; i < numFlares; i++) {
+        ctx.save();
+        const angleOffset = (i * Math.PI * 2 / numFlares);
+        ctx.rotate(angleOffset + ball.rotation * (0.8 + i * 0.1) + Math.sin(time * 0.5 + i) * 0.3);
+
+        const stretch = ball.radius * (1.2 + Math.sin(time * 1.8 + i * 1.3) * 0.9);
+        const thickness = ball.radius * (0.3 + Math.sin(time * 1.2 + i * 0.8) * 0.15);
+
+        ctx.beginPath();
+        ctx.ellipse(0, 0, stretch, thickness, 0, 0, Math.PI * 2);
+        const flareColor = ctx.createRadialGradient(0, 0, 0, 0, 0, stretch);
+        flareColor.addColorStop(0, `rgba(255, 220, 100, ${0.8 * p})`);
+        flareColor.addColorStop(0.3, `rgba(255, 100, 0, ${0.5 * p})`);
+        flareColor.addColorStop(1, 'rgba(200, 20, 0, 0)');
+        ctx.fillStyle = flareColor;
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // Hot inner core
+      const coreR = ball.radius * 0.9;
+      const coreLight = ctx.createRadialGradient(0, 0, 0, 0, 0, coreR);
+      coreLight.addColorStop(0, `rgba(255, 255, 255, ${1.0 * p})`);
+      coreLight.addColorStop(0.2, `rgba(255, 255, 200, ${0.9 * p})`);
+      coreLight.addColorStop(0.6, `rgba(255, 200, 50, ${0.7 * p})`);
+      coreLight.addColorStop(1, 'rgba(255, 100, 0, 0)');
+      ctx.beginPath();
+      ctx.fillStyle = coreLight;
+      ctx.arc(0, 0, coreR, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.restore();
+    }
+
+    function animate(timestamp) {
+      if (!timestamp) timestamp = performance.now();
+      const elapsed = lastFrameTime ? (timestamp - lastFrameTime) : 16.667;
+      lastFrameTime = timestamp;
+      // Clamp to avoid spiral of death on tab-switch; baseline = 60fps (16.667ms)
+      dtScale = Math.min(elapsed, 50) / 16.667;
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.03)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      updateBall();
+      let activeSpiralsCount = 0;
+      for (let i = 0; i < spirals.length; i++) {
+        if (spirals[i].update()) {
+          spirals[i].draw();
+          if (i !== activeSpiralsCount) spirals[activeSpiralsCount] = spirals[i];
+          activeSpiralsCount++;
+        }
+      }
+      spirals.length = activeSpiralsCount;
+      ctx.save();
+      const dpr = window.devicePixelRatio || 1;
+      ctx.globalCompositeOperation = 'lighter';
+      if (dpr > 1) { ctx.globalAlpha = 0.85; }
+      for (let i = 0; i < particles.length; i++) { particles[i].draw(); }
+      if (dpr > 1) { ctx.globalAlpha = 1; }
+      ctx.restore();
+      drawBall();
+      if (isHolding) {
+        holdDuration++;
+      }
+      requestAnimationFrame(animate);
+    }
+
+    async function startInteraction(e) {
+      hasInteracted = true;
+      if (!audioContext) {
+        await unlockAudioOnStart();
+      }
+      const justLit = !matchPlayed;
+      if (!matchPlayed) {
+        createMatchStrikeSound().catch(error => console.warn('Failed to play match strike sound:', error));
+        const matchAudio = document.getElementById('matchSound');
+        try { matchAudio && matchAudio.play && matchAudio.play().catch(() => { }); } catch (_) { }
+        matchPlayed = true;
+        ballAnimationActive = true;
+        if (introText) {
+          if (introIntervalId) clearInterval(introIntervalId);
+          introText.style.animation = 'textHide 0.8s cubic-bezier(0.8, 0, 0.2, 1) forwards';
+          setTimeout(() => { introText && (introText.style.display = 'none'); }, 900);
+        }
+        if (!initialSpiralSpawned) {
+          spirals.push(new SnakeSpiral(ball.x, ball.y, true, 0));
+          initialSpiralSpawned = true;
+        }
+      }
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      currentX = ((e.clientX || (e.touches && e.touches[0]?.clientX)) - rect.left) * dpr;
+      currentY = ((e.clientY || (e.touches && e.touches[0]?.clientY)) - rect.top) * dpr;
+      isHolding = true;
+      holdDuration = 0;
+      {
+        const dx = currentX - ball.x;
+        const dy = currentY - ball.y;
+        const distance = Math.hypot(dx, dy);
+        if (distance > 0.001) {
+          const impulse = Math.min(8, Math.max(4, distance * 0.02));
+          ball.vx += (dx / distance) * impulse;
+          ball.vy += (dy / distance) * impulse;
+          const speedNow = Math.hypot(ball.vx, ball.vy);
+          if (speedNow > ball.maxSpeed) {
+            ball.vx = (ball.vx / speedNow) * ball.maxSpeed;
+            ball.vy = (ball.vy / speedNow) * ball.maxSpeed;
+          }
+        }
+      }
+      try { if (e.pointerId != null) canvas.setPointerCapture(e.pointerId); } catch (_) { }
+      spirals.push(new SnakeSpiral(currentX, currentY, true));
+    }
+
+    function moveInteraction(e) {
+      if (!isHolding) return;
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const rawX = (e.clientX != null ? e.clientX : (e.touches && e.touches[0]?.clientX));
+      const rawY = (e.clientY != null ? e.clientY : (e.touches && e.touches[0]?.clientY));
+      if (rawX == null || rawY == null) return;
+      const clampedX = Math.min(Math.max(rawX, rect.left + 1), rect.right - 1);
+      const clampedY = Math.min(Math.max(rawY, rect.top + 1), rect.bottom - 1);
+      const dpr = window.devicePixelRatio || 1;
+      currentX = (clampedX - rect.left) * dpr;
+      currentY = (clampedY - rect.top) * dpr;
+    }
+
+    function endInteraction(e) {
+      isHolding = false;
+      try { if (e && e.pointerId != null) canvas.releasePointerCapture(e.pointerId); } catch (_) { }
+    }
+
+    if (window.PointerEvent) {
+      canvas.addEventListener('pointerdown', startInteraction);
+      canvas.addEventListener('pointermove', moveInteraction);
+      canvas.addEventListener('pointerup', endInteraction);
+      canvas.addEventListener('pointercancel', endInteraction);
+      canvas.addEventListener('pointerleave', endInteraction);
+      canvas.addEventListener('pointerout', endInteraction);
+    } else {
+      canvas.addEventListener('mousedown', startInteraction);
+      canvas.addEventListener('touchstart', startInteraction, { passive: false });
+      canvas.addEventListener('mousemove', moveInteraction);
+      canvas.addEventListener('touchmove', moveInteraction, { passive: false });
+      canvas.addEventListener('mouseup', endInteraction);
+      canvas.addEventListener('touchend', endInteraction);
+    }
+
+    animate();
+
+
+    // Enhanced global audio unlock with better error handling
+    document.addEventListener('pointerdown', () => {
+      if (!window.chromeAudioUnlocked) {
+        unlockAudioOnStart().then(success => {
+          if (!success) {
+            console.warn('Global audio unlock attempt failed on pointerdown');
+          }
+        });
+      }
+    }, { passive: true, capture: true });
+
+    document.addEventListener('touchstart', () => {
+      if (!window.chromeAudioUnlocked) {
+        unlockAudioOnStart().then(success => {
+          if (!success) {
+            console.warn('Global audio unlock attempt failed on touchstart');
+          }
+        });
+      }
+    }, { passive: true, capture: true });
+
+    // Show intro text immediately on load (no overlay gate anymore)
+    (function showIntroText() {
+      if (!introText) return;
+      introText.innerHTML = 'Take your time<br>Flame Thrower';
+      const reveal = () => {
+        introText.style.display = 'block';
+        introText.style.animation = 'textReveal 2.5s cubic-bezier(0.2, 0.8, 0.2, 1) forwards';
+      };
+      try {
+        if (document.fonts && typeof document.fonts.ready?.then === 'function') {
+          document.fonts.ready.then(reveal).catch(reveal);
+        } else { setTimeout(reveal, 50); }
+      } catch (_) { setTimeout(reveal, 50); }
+
+      // Cycle between prompts until match is struck
+      introIntervalId = setInterval(() => {
+        if (!introText || matchPlayed) { clearInterval(introIntervalId); return; }
+        const currentText = introText.innerHTML;
+        introText.style.animation = 'textHide 1.5s cubic-bezier(0.8, 0, 0.2, 1) forwards';
+        setTimeout(() => {
+          if (!introText || matchPlayed) return;
+          introText.innerHTML = (currentText === 'Take your time<br>Flame Thrower')
+            ? 'Touch to strike<br>the match'
+            : 'Take your time<br>Flame Thrower';
+          introText.style.animation = 'textReveal 2s cubic-bezier(0.2, 0.8, 0.2, 1) forwards';
+        }, 1800);
+      }, 5500);
+    })();
+
+    // Additional fallback for immediate audio unlock attempt
+    setTimeout(() => {
+      if (!window.chromeAudioUnlocked && !audioInitialized) {
+        console.log('Attempting fallback audio initialization...');
+        unlockAudioOnStart().catch(() => {
+          console.warn('Fallback audio initialization failed');
+        });
+      }
+    }, 1000);
+
+    function stopAllSizzles() {
+      isHolding = false;
+      for (let i = 0; i < spirals.length; i++) {
+        spirals[i]._stopSizzle();
+      }
+    }
+
+    // Mute/suspend audio when switching tabs
+    document.addEventListener('visibilitychange', () => {
+      if (!audioContext) return;
+      if (document.hidden) {
+        stopAllSizzles();
+        audioContext.suspend().catch(console.warn);
+      } else {
+        if (window.chromeAudioUnlocked) {
+          audioContext.resume().catch(console.warn);
+        }
+      }
+    });
+  </script>
+</body>
+
+</html>
