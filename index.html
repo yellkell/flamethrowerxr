@@ -6,152 +6,331 @@
   <title>Flamethrower XR - Pass-through</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r134/three.min.js"></script>
   <style>
-    body { margin:0; overflow:hidden; background:#000; }
+    html,body { margin:0; height:100%; overflow:hidden; background:#000; touch-action:none; }
     canvas { display:block; }
-    #ui { position:absolute; top:15px; left:15px; color:#ffaa00; font-family:sans-serif; text-shadow:0 0 10px #ff5500; z-index:10; }
-    #start { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); padding:15px 30px; font-size:18px; background:#ff5500; color:#000; border:none; border-radius:8px; cursor:pointer; z-index:100; }
+    #ui {
+      position:absolute; top:15px; left:15px; color:#ffaa00;
+      font-family:sans-serif; text-shadow:0 0 12px #ff5500; z-index:10;
+      font-size:18px; letter-spacing:1px; pointer-events:none;
+    }
+    #hint {
+      position:absolute; bottom:18px; left:50%; transform:translateX(-50%);
+      color:#ffcc66; font-family:sans-serif; font-size:13px; opacity:.75;
+      text-shadow:0 0 8px #ff5500; z-index:10; pointer-events:none; text-align:center;
+    }
+    .btn {
+      position:absolute; left:50%; transform:translateX(-50%);
+      padding:15px 30px; font-size:17px; font-weight:bold; color:#000;
+      background:linear-gradient(#ffcc33,#ff5500); border:none; border-radius:10px;
+      cursor:pointer; z-index:100; box-shadow:0 0 25px #ff5500;
+      font-family:sans-serif; letter-spacing:1px;
+    }
+    #start   { top:46%; }
+    #preview { top:46%; margin-top:64px; background:linear-gradient(#666,#222); color:#fff; box-shadow:0 0 15px #000; font-size:14px; padding:12px 22px; }
   </style>
 </head>
 <body>
   <div id="ui">FLAMETHROWER XR 🔥🌀</div>
-  <button id="start">ENTER AR PASS-THROUGH</button>
+  <button id="start" class="btn">ENTER AR PASS-THROUGH</button>
+  <button id="preview" class="btn">👀 Preview in browser (no headset)</button>
+  <div id="hint"></div>
 
   <script>
     let scene, camera, renderer, xrSession, controller1, controller2;
-    let ball, velocity = new THREE.Vector3();
-    let isAttracted = false, orbitAngle = 0, targetHand = null;
+    let ball, ballCore, ballGlow, ballLight;
+    let velocity = new THREE.Vector3();
+    let mode = 'idle';            // 'idle' | 'attracted' | 'free'
+    let orbitAngle = 0, targetController = null;
+    let isPreview = false, idleTime = 0;
     const spirals = [];
     const tempVec = new THREE.Vector3();
+    const homePos = new THREE.Vector3(0, 1.3, -1.0);
+
+    // ---- collision: real room surfaces (floor + walls) ----
+    const ballRadius = 0.1;
+    let colliders = [];
+    const _m = new THREE.Matrix4();
+    const _a = new THREE.Vector3();
+    const _n = new THREE.Vector3();
+    // fallback floor (used until/unless real planes are detected)
+    const floorCollider = {
+      point: new THREE.Vector3(0, 0, 0), normal: new THREE.Vector3(0, 1, 0),
+      xAxis: new THREE.Vector3(1, 0, 0), zAxis: new THREE.Vector3(0, 0, 1),
+      halfX: 50, halfZ: 50
+    };
 
     const startBtn = document.getElementById('start');
-    startBtn.addEventListener('click', initXR);
+    const previewBtn = document.getElementById('preview');
+    const hintEl = document.getElementById('hint');
 
-    async function initXR() {
-      if (!navigator.xr) return alert("WebXR not supported");
+    startBtn.addEventListener('click', () => init(false));
+    previewBtn.addEventListener('click', () => init(true));
+
+    // Hide AR button if WebXR / immersive-ar isn't available; preview still works.
+    if (navigator.xr) {
+      navigator.xr.isSessionSupported('immersive-ar').then(ok => {
+        if (!ok) startBtn.style.display = 'none';
+      }).catch(() => { startBtn.style.display = 'none'; });
+    } else {
       startBtn.style.display = 'none';
+    }
+
+    /* ---------- FIRE BALL ---------- */
+    const NOISE_GLSL = `
+      vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}
+      vec4 mod289(vec4 x){return x-floor(x*(1.0/289.0))*289.0;}
+      vec4 permute(vec4 x){return mod289(((x*34.0)+1.0)*x);}
+      vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-0.85373472095314*r;}
+      float snoise(vec3 v){
+        const vec2 C=vec2(1.0/6.0,1.0/3.0); const vec4 D=vec4(0.0,0.5,1.0,2.0);
+        vec3 i=floor(v+dot(v,C.yyy)); vec3 x0=v-i+dot(i,C.xxx);
+        vec3 g=step(x0.yzx,x0.xyz); vec3 l=1.0-g; vec3 i1=min(g.xyz,l.zxy); vec3 i2=max(g.xyz,l.zxy);
+        vec3 x1=x0-i1+C.xxx; vec3 x2=x0-i2+C.yyy; vec3 x3=x0-D.yyy;
+        i=mod289(i);
+        vec4 p=permute(permute(permute(i.z+vec4(0.0,i1.z,i2.z,1.0))+i.y+vec4(0.0,i1.y,i2.y,1.0))+i.x+vec4(0.0,i1.x,i2.x,1.0));
+        float n_=0.142857142857; vec3 ns=n_*D.wyz-D.xzx;
+        vec4 j=p-49.0*floor(p*ns.z*ns.z);
+        vec4 x_=floor(j*ns.z); vec4 y_=floor(j-7.0*x_);
+        vec4 x=x_*ns.x+ns.yyyy; vec4 y=y_*ns.x+ns.yyyy; vec4 h=1.0-abs(x)-abs(y);
+        vec4 b0=vec4(x.xy,y.xy); vec4 b1=vec4(x.zw,y.zw);
+        vec4 s0=floor(b0)*2.0+1.0; vec4 s1=floor(b1)*2.0+1.0; vec4 sh=-step(h,vec4(0.0));
+        vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy; vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+        vec3 p0=vec3(a0.xy,h.x); vec3 p1=vec3(a0.zw,h.y); vec3 p2=vec3(a1.xy,h.z); vec3 p3=vec3(a1.zw,h.w);
+        vec4 norm=taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+        p0*=norm.x;p1*=norm.y;p2*=norm.z;p3*=norm.w;
+        vec4 m=max(0.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.0); m=m*m;
+        return 42.0*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+      }
+      float fbm(vec3 p){ float a=0.0,w=0.5; for(int i=0;i<5;i++){ a+=w*snoise(p); p*=2.02; w*=0.5;} return a; }
+    `;
+
+    function makeFireBall() {
+      const group = new THREE.Group();
+
+      // Animated fire core
+      const coreMat = new THREE.ShaderMaterial({
+        uniforms: { uTime: { value: 0 }, uHeat: { value: 1.0 } },
+        vertexShader: `
+          varying vec3 vPos; varying vec3 vN;
+          void main(){ vPos=position; vN=normal;
+            gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+        fragmentShader: NOISE_GLSL + `
+          uniform float uTime, uHeat; varying vec3 vPos; varying vec3 vN;
+          void main(){
+            vec3 q = vPos*4.0;
+            q.y -= uTime*1.6;                          // flames lick upward
+            float n = fbm(q + vec3(0.0, uTime*0.4, 0.0));
+            float n2 = fbm(vPos*8.0 + uTime*0.8);
+            float heat = (n*0.6 + n2*0.4)*0.5 + 0.6;
+            heat = clamp(heat*uHeat, 0.0, 1.6);
+            // fire gradient: dark red -> orange -> yellow -> white
+            vec3 col = vec3(0.35,0.02,0.0);
+            col = mix(col, vec3(1.0,0.25,0.0), smoothstep(0.30,0.75,heat));
+            col = mix(col, vec3(1.0,0.75,0.10), smoothstep(0.70,1.05,heat));
+            col = mix(col, vec3(1.0,0.97,0.80), smoothstep(1.00,1.45,heat));
+            gl_FragColor = vec4(col*2.2, 1.0);
+          }`,
+      });
+      ballCore = new THREE.Mesh(new THREE.IcosahedronGeometry(0.1, 5), coreMat);
+      group.add(ballCore);
+
+      // Additive fresnel glow halo
+      const glowMat = new THREE.ShaderMaterial({
+        uniforms: { uTime: { value: 0 } },
+        transparent: true, blending: THREE.AdditiveBlending,
+        side: THREE.BackSide, depthWrite: false,
+        vertexShader: `
+          varying vec3 vWN; varying vec3 vWP;
+          void main(){ vWN=normalize(mat3(modelMatrix)*normal);
+            vec4 wp=modelMatrix*vec4(position,1.0); vWP=wp.xyz;
+            gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+        fragmentShader: `
+          uniform float uTime; varying vec3 vWN; varying vec3 vWP;
+          void main(){
+            float f=pow(1.0-max(dot(normalize(vWN),normalize(cameraPosition-vWP)),0.0),2.2);
+            float pulse=0.85+0.15*sin(uTime*9.0);
+            gl_FragColor=vec4(vec3(1.0,0.45,0.08)*f*pulse, f);
+          }`,
+      });
+      ballGlow = new THREE.Mesh(new THREE.IcosahedronGeometry(0.17, 3), glowMat);
+      group.add(ballGlow);
+
+      ballLight = new THREE.PointLight(0xff5500, 5, 7, 2);
+      group.add(ballLight);
+
+      group.position.copy(homePos);
+      return group;
+    }
+
+    /* ---------- INIT ---------- */
+    async function init(preview) {
+      isPreview = preview;
+      startBtn.style.display = 'none';
+      previewBtn.style.display = 'none';
 
       scene = new THREE.Scene();
-      camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 50);
+      camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 100);
 
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      renderer.xr.enabled = true;
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: !preview });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.setClearColor(0x000000, preview ? 1 : 0); // opaque for preview, transparent for AR passthrough
       document.body.appendChild(renderer.domElement);
 
-      // Passthrough requires transparent renderer + black background
-      renderer.setClearColor(0x000000, 0);
+      scene.add(new THREE.AmbientLight(0x404050, 0.7));
+      scene.add(new THREE.HemisphereLight(0xffeedd, 0x202030, 0.5));
 
-      // Lights
-      scene.add(new THREE.AmbientLight(0x404040, 0.6));
-      const sun = new THREE.PointLight(0xffddaa, 1.2, 0);
-      scene.add(sun);
-
-      // Fiery Ball
-      const ballGeo = new THREE.SphereGeometry(0.1, 32, 32);
-      const ballMat = new THREE.MeshPhongMaterial({ color: 0xff5500, emissive: 0xff8800, emissiveIntensity: 5, shininess: 90 });
-      ball = new THREE.Mesh(ballGeo, ballMat);
-      ball.position.set(0, 1.2, -1.5);
+      ball = makeFireBall();
       scene.add(ball);
 
-      const ballLight = new THREE.PointLight(0xff5500, 4, 6);
-      ball.add(ballLight);
+      if (preview) initPreview();
+      else await initXR();
 
-      // XR Session (Immersive AR for passthrough)
+      lastTime = performance.now();
+      renderer.setAnimationLoop(animate);
+    }
+
+    /* ---------- AR ---------- */
+    async function initXR() {
+      hintEl.textContent = 'Hold a trigger to attract the fire — release to bounce it off your real floor & walls 🔥';
+      renderer.xr.enabled = true;
+      colliders = [floorCollider]; // until real planes arrive
       try {
-        xrSession = await navigator.xr.requestSession("immersive-ar", {
-          requiredFeatures: ["local-floor"],
-          optionalFeatures: ["hand-tracking"]
+        xrSession = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['local-floor'],
+          optionalFeatures: ['hand-tracking', 'plane-detection', 'mesh-detection']
         });
-
-        renderer.xr.setSession(xrSession);
-
+        await renderer.xr.setSession(xrSession);
         xrSession.addEventListener('end', () => location.reload());
 
-        // Controllers / Hands
-        const controllerGrip1 = renderer.xr.getControllerGrip(0);
-        const controllerGrip2 = renderer.xr.getControllerGrip(1);
-        scene.add(controllerGrip1, controllerGrip2);
-
+        scene.add(renderer.xr.getControllerGrip(0), renderer.xr.getControllerGrip(1));
         controller1 = renderer.xr.getController(0);
         controller2 = renderer.xr.getController(1);
         scene.add(controller1, controller2);
 
-        // Button events on controllers
-        controller1.addEventListener('selectstart', () => startOrbit('left'));
-        controller1.addEventListener('selectend', () => endOrbit());
-        controller2.addEventListener('selectstart', () => startOrbit('right'));
-        controller2.addEventListener('selectend', () => endOrbit());
+        const addPointer = (c) => {
+          const g = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,-0.4)]);
+          c.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xff7700 })));
+        };
+        addPointer(controller1); addPointer(controller2);
 
+        controller1.addEventListener('selectstart', () => grab(controller1));
+        controller1.addEventListener('selectend', release);
+        controller2.addEventListener('selectstart', () => grab(controller2));
+        controller2.addEventListener('selectend', release);
       } catch (e) {
-        alert("Failed to start AR session: " + e.message);
+        alert('Failed to start AR session: ' + e.message);
+        location.reload();
       }
-
-      animate();
     }
 
-    function startOrbit(hand) {
-      isAttracted = true;
-      targetHand = hand;
-    }
-
-    function endOrbit() {
-      if (!isAttracted) return;
-      isAttracted = false;
-      // Release with tangential velocity
-      velocity.set(
-        Math.cos(orbitAngle) * 5,
-        2 + Math.random() * 2,
-        Math.sin(orbitAngle) * 5 - 3
+    /* ---------- PREVIEW (browser, no headset) ---------- */
+    let camYaw = 0, camPitch = 0, dragging = false, lastX = 0, lastY = 0, demoT = 0;
+    function initPreview() {
+      hintEl.textContent = 'Preview mode — drag to look around. (Open on a Quest for the real AR experience.)';
+      // floor grid + faint wireframe "room" so you can see it bounce off floor & walls
+      const grid = new THREE.GridHelper(10, 20, 0xff6600, 0x331100);
+      grid.material.opacity = 0.35; grid.material.transparent = true;
+      scene.add(grid);
+      const room = new THREE.Mesh(
+        new THREE.BoxGeometry(5, 3, 4),
+        new THREE.MeshBasicMaterial({ color: 0xff6600, wireframe: true, transparent: true, opacity: 0.12 })
       );
-      spawnSpirals(5, ball.position.clone());
+      room.position.set(0, 1.5, -1.5);
+      scene.add(room);
+
+      // matching colliders: floor, ceiling, 4 walls (room spans x[-2.5,2.5] y[0,3] z[-3.5,0.5])
+      const wall = (px, py, pz, nx, ny, nz, ax, ay, az, hx, hz) => ({
+        point: new THREE.Vector3(px, py, pz), normal: new THREE.Vector3(nx, ny, nz),
+        xAxis: new THREE.Vector3(ax, ay, az),
+        zAxis: new THREE.Vector3(nx, ny, nz).cross(new THREE.Vector3(ax, ay, az)).normalize(),
+        halfX: hx, halfZ: hz
+      });
+      colliders = [
+        wall(0, 0, -1.5, 0, 1, 0, 1, 0, 0, 2.5, 2.5),   // floor
+        wall(0, 3, -1.5, 0, -1, 0, 1, 0, 0, 2.5, 2.5),  // ceiling
+        wall(0, 1.5, -3.5, 0, 0, 1, 1, 0, 0, 2.5, 1.5), // back wall
+        wall(0, 1.5, 0.5, 0, 0, -1, 1, 0, 0, 2.5, 1.5), // front wall
+        wall(-2.5, 1.5, -1.5, 1, 0, 0, 0, 0, 1, 2.5, 1.5), // left wall
+        wall(2.5, 1.5, -1.5, -1, 0, 0, 0, 0, 1, 2.5, 1.5)  // right wall
+      ];
+
+      camera.position.set(0, 1.6, 0);
+      updatePreviewCam();
+
+      const el = renderer.domElement;
+      el.addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+      addEventListener('pointerup', () => dragging = false);
+      addEventListener('pointermove', e => {
+        if (!dragging) return;
+        camYaw   -= (e.clientX - lastX) * 0.005;
+        camPitch -= (e.clientY - lastY) * 0.005;
+        camPitch = Math.max(-1.2, Math.min(1.2, camPitch));
+        lastX = e.clientX; lastY = e.clientY;
+        updatePreviewCam();
+      });
+    }
+    function updatePreviewCam() {
+      camera.position.set(0, 1.6, 0);
+      const dir = new THREE.Vector3(
+        Math.sin(camYaw) * Math.cos(camPitch),
+        Math.sin(camPitch),
+        -Math.cos(camYaw) * Math.cos(camPitch)
+      );
+      camera.lookAt(camera.position.clone().add(dir));
     }
 
+    /* ---------- INTERACTION ---------- */
+    function grab(controller) {
+      // ignore controllers that aren't tracked yet (would report origin)
+      mode = 'attracted';
+      targetController = controller;
+    }
+    function release() {
+      if (mode !== 'attracted') return;
+      mode = 'free';
+      const speed = 4.5;
+      velocity.set(
+        -Math.sin(orbitAngle) * speed,
+        2.5 + Math.random() * 1.5,
+        Math.cos(orbitAngle) * speed - 2.0
+      );
+      spawnSpirals(6, ball.position);
+    }
+
+    /* ---------- SNAKE SPIRALS ---------- */
     class SnakeSpiral {
       constructor(startPos) {
-        this.points = [startPos.clone()];
+        this.points = [startPos.clone(), startPos.clone().add(new THREE.Vector3(0,0.01,0))];
         this.angle = Math.random() * Math.PI * 2;
         this.angleSpeed = (0.18 + Math.random() * 0.35) * (Math.random() < 0.5 ? 1 : -1);
-        this.maxPoints = 70;
-        this.opacity = 1.0;
-        this.hueShift = Math.random() * 0.18;
-
+        this.maxPoints = 70; this.opacity = 1.0; this.hueShift = Math.random() * 0.18;
         this.material = new THREE.ShaderMaterial({
-          uniforms: { uTime: {value:0}, uOpacity:{value:1}, uHueShift:{value:this.hueShift} },
-          vertexShader: `varying vec2 vUv; uniform float uTime; void main(){ vUv=uv; vec3 p=position; p += normal * sin(uTime*12.0 + position.y*22.0)*0.009; gl_Position = projectionMatrix * modelViewMatrix * vec4(p,1.0); }`,
+          uniforms: { uTime:{value:0}, uOpacity:{value:1}, uHueShift:{value:this.hueShift} },
+          vertexShader: `varying vec2 vUv; uniform float uTime; void main(){ vUv=uv; vec3 p=position; p+=normal*sin(uTime*12.0+position.y*22.0)*0.009; gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.0); }`,
           fragmentShader: `
-            varying vec2 vUv; uniform float uTime, uOpacity, uHueShift;
-            vec3 hslToRgb(float h,float s,float l){ /* same hsl function as before */
-              vec3 rgb=vec3(0.); float c=(1.-abs(2.*l-1.))*s, x=c*(1.-abs(mod(h*6.,2.)-1.)), m=l-c*.5;
-              if(h<1./6.)rgb=vec3(c,x,0.); else if(h<2./6.)rgb=vec3(x,c,0.); else if(h<3./6.)rgb=vec3(0.,c,x);
-              else if(h<4./6.)rgb=vec3(0.,x,c); else if(h<5./6.)rgb=vec3(x,0.,c); else rgb=vec3(c,0.,x);
-              return rgb+m;
-            }
+            varying vec2 vUv; uniform float uTime,uOpacity,uHueShift;
+            vec3 hslToRgb(float h,float s,float l){
+              vec3 rgb=vec3(0.); float c=(1.-abs(2.*l-1.))*s,x=c*(1.-abs(mod(h*6.,2.)-1.)),m=l-c*.5;
+              if(h<1./6.)rgb=vec3(c,x,0.);else if(h<2./6.)rgb=vec3(x,c,0.);else if(h<3./6.)rgb=vec3(0.,c,x);
+              else if(h<4./6.)rgb=vec3(0.,x,c);else if(h<5./6.)rgb=vec3(x,0.,c);else rgb=vec3(c,0.,x);
+              return rgb+m; }
             void main(){
-              float p = vUv.y; float i = pow(p,0.55);
-              float f = 0.75 + 0.25*sin(uTime*18.+vUv.y*35.);
-              i *= f; float h = 0.04 + uHueShift + (1.-p)*0.13;
-              vec3 col = hslToRgb(h,1.,0.58 + i*0.42);
-              gl_FragColor = vec4(col * (i*3.8 + 1.6), uOpacity * i * 0.95);
-            }
-          `,
-          transparent: true, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false
+              float p=vUv.y; float i=pow(p,0.55); float f=0.75+0.25*sin(uTime*18.+vUv.y*35.);
+              i*=f; float h=0.04+uHueShift+(1.-p)*0.13;
+              vec3 col=hslToRgb(h,1.,0.58+i*0.42);
+              gl_FragColor=vec4(col*(i*3.8+1.6), uOpacity*i*0.95); }`,
+          transparent:true, blending:THREE.AdditiveBlending, side:THREE.DoubleSide, depthWrite:false
         });
-
         this.curve = new THREE.CatmullRomCurve3(this.points);
-        this.geometry = new THREE.TubeGeometry(this.curve, 32, 0.08, 8, false);
-        this.mesh = new THREE.Mesh(this.geometry, this.material);
+        this.mesh = new THREE.Mesh(new THREE.TubeGeometry(this.curve, 32, 0.08, 8, false), this.material);
         scene.add(this.mesh);
       }
-
       update(delta) {
         if (this.points.length < this.maxPoints) {
-          const last = this.points[this.points.length-1];
+          const last = this.points[this.points.length - 1];
           this.angle += this.angleSpeed;
-          const next = last.clone().add(new THREE.Vector3(
-            Math.cos(this.angle)*0.065, -0.012, Math.sin(this.angle)*0.065
-          ));
-          this.points.push(next);
+          this.points.push(last.clone().add(new THREE.Vector3(Math.cos(this.angle)*0.065, -0.012, Math.sin(this.angle)*0.065)));
           this.curve.points = this.points;
           this.mesh.geometry.dispose();
           this.mesh.geometry = new THREE.TubeGeometry(this.curve, 32, 0.08, 8, false);
@@ -162,62 +341,120 @@
         return this.opacity > 0;
       }
     }
+    function spawnSpirals(n, pos) { for (let i = 0; i < n; i++) spirals.push(new SnakeSpiral(pos)); }
 
-    function spawnSpirals(count, pos) {
-      for (let i = 0; i < count; i++) spirals.push(new SnakeSpiral(pos));
+    /* ---------- REAL-WORLD PLANES + COLLISION ---------- */
+    // Rebuild colliders from the headset's detected real-world planes each frame.
+    function updatePlanes(frame) {
+      const ref = renderer.xr.getReferenceSpace();
+      if (!ref || !frame.detectedPlanes) return; // feature unsupported -> keep fallback floor
+      const list = [floorCollider];
+      frame.detectedPlanes.forEach(plane => {
+        const pose = frame.getPose(plane.planeSpace, ref);
+        if (!pose) return;
+        _m.fromArray(pose.transform.matrix);
+        const e = _m.elements;
+        const point = new THREE.Vector3(e[12], e[13], e[14]);
+        const xAxis = new THREE.Vector3(e[0], e[1], e[2]).normalize();   // plane local X
+        const normal = new THREE.Vector3(e[4], e[5], e[6]).normalize();  // plane local Y (surface normal)
+        const zAxis = new THREE.Vector3(e[8], e[9], e[10]).normalize();  // plane local Z
+        let hx = 0, hz = 0;
+        if (plane.polygon) for (const p of plane.polygon) { hx = Math.max(hx, Math.abs(p.x)); hz = Math.max(hz, Math.abs(p.z)); }
+        list.push({ point, normal, xAxis, zAxis, halfX: hx || 2, halfZ: hz || 2 });
+      });
+      colliders = list;
     }
 
+    // Reflect the ball off any surface it hits; returns the surface normal (or null).
+    function collide(pos, vel, radius) {
+      for (const c of colliders) {
+        _a.subVectors(pos, c.point);
+        _n.copy(c.normal);
+        let d = _a.dot(_n);
+        if (d < 0) { _n.negate(); d = -d; }        // make the normal face the ball
+        if (d > radius || d < -radius * 4) continue; // not touching this surface
+        const px = _a.dot(c.xAxis), pz = _a.dot(c.zAxis);
+        if (Math.abs(px) > c.halfX + radius || Math.abs(pz) > c.halfZ + radius) continue; // off the edge
+        const vn = vel.dot(_n);
+        if (vn < 0) {
+          vel.addScaledVector(_n, -1.6 * vn); // bounce, restitution 0.6
+          vel.multiplyScalar(0.82);           // friction
+          pos.addScaledVector(_n, radius - d); // push out of surface
+          spawnSpirals(5, pos);
+          return _n.clone();
+        }
+      }
+      return null;
+    }
+
+    /* ---------- LOOP ---------- */
     let lastTime = performance.now();
-    function animate() {
+    function animate(time, frame) {
       const now = performance.now();
-      const delta = (now - lastTime) / 1000;
+      const delta = Math.min((now - lastTime) / 1000, 0.05);
       lastTime = now;
+      const t = now / 1000;
 
-      if (renderer.xr.isPresenting) {
-        const referenceSpace = renderer.xr.getReferenceSpace();
+      // animate fire shaders + flickering light
+      ballCore.material.uniforms.uTime.value = t;
+      ballGlow.material.uniforms.uTime.value = t;
+      ballLight.intensity = 4 + Math.sin(t * 25) * 0.8 + Math.sin(t * 11) * 0.6;
 
-        // Simple orbit simulation using controller position
-        if (isAttracted && targetHand) {
-          const ctrl = targetHand === 'left' ? controller1 : controller2;
-          if (ctrl) {
-            orbitAngle += 9 * delta;
-            const handPos = ctrl.getWorldPosition(tempVec);
-            const offset = new THREE.Vector3(
-              Math.cos(orbitAngle) * 0.4,
-              Math.sin(orbitAngle * 1.4) * 0.1,
-              Math.sin(orbitAngle) * 0.4
-            );
-            ball.position.copy(handPos).add(offset);
-          }
-        } else {
-          velocity.y -= 12 * delta;
-          ball.position.addScaledVector(velocity, delta * 2.2);
+      // pull real-world floor/wall geometry from the headset
+      if (!isPreview && frame) updatePlanes(frame);
 
-          // Basic bounces
-          if (ball.position.y < 0.15) {
-            ball.position.y = 0.15;
-            velocity.y *= -0.65;
-            spawnSpirals(5, ball.position);
-          }
+      // Preview: scripted demo so you can see all the visuals hands-free
+      if (isPreview) {
+        demoT += delta;
+        if (mode === 'idle' && demoT > 1.5) { orbitAngle = 0; mode = 'attracted'; targetController = null; }
+        else if (mode === 'attracted' && demoT > 4.0) { release(); demoT = 0; }
+      }
+
+      if (mode === 'attracted') {
+        orbitAngle += 6 * delta;
+        // anchor: real controller in AR, or a point in front of camera in preview
+        let anchor;
+        if (targetController) anchor = targetController.getWorldPosition(tempVec);
+        else { anchor = tempVec.copy(homePos); }
+        const r = 0.35;
+        const desired = new THREE.Vector3(
+          anchor.x + Math.cos(orbitAngle) * r,
+          anchor.y + 0.05 + Math.sin(orbitAngle * 1.7) * 0.12,
+          anchor.z + Math.sin(orbitAngle) * r
+        );
+        // smooth magnetic pull (frame-rate independent)
+        ball.position.lerp(desired, 1 - Math.exp(-9 * delta));
+        ballCore.material.uniforms.uHeat.value = 1.5; // hotter while charging
+      } else if (mode === 'free') {
+        ballCore.material.uniforms.uHeat.value = 1.1;
+        velocity.y -= 9.8 * delta;
+        ball.position.addScaledVector(velocity, delta);
+        const hit = collide(ball.position, velocity, ballRadius); // bounce off real floor/walls
+        if (hit && hit.y > 0.5 && velocity.length() < 1.2) {      // resting on a floor -> idle
+          mode = 'idle'; idleTime = 0; velocity.set(0, 0, 0);
         }
-
-        // Update spirals
-        for (let i = spirals.length - 1; i >= 0; i--) {
-          if (!spirals[i].update(delta)) {
-            scene.remove(spirals[i].mesh);
-            spirals.splice(i, 1);
-          }
+        if (ball.position.y < -3) {                                // safety: escaped the room
+          mode = 'idle'; idleTime = 0; velocity.set(0, 0, 0); ball.position.copy(homePos);
         }
+      } else { // idle: gently bob & drift back home
+        ballCore.material.uniforms.uHeat.value = 1.0;
+        idleTime += delta;
+        const target = tempVec.copy(homePos); target.y += Math.sin(idleTime * 1.5) * 0.04;
+        ball.position.lerp(target, 1 - Math.exp(-3 * delta));
+      }
+
+      for (let i = spirals.length - 1; i >= 0; i--) {
+        if (!spirals[i].update(delta)) { scene.remove(spirals[i].mesh); spirals[i].mesh.geometry.dispose(); spirals.splice(i, 1); }
       }
 
       renderer.render(scene, camera);
-      requestAnimationFrame(animate);
     }
 
-    window.addEventListener('resize', () => {
-      if (camera) camera.aspect = window.innerWidth / window.innerHeight;
-      if (camera) camera.updateProjectionMatrix();
-      if (renderer) renderer.setSize(window.innerWidth, window.innerHeight);
+    addEventListener('resize', () => {
+      if (!camera) return;
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
     });
   </script>
 </body>
