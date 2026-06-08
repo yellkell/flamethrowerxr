@@ -37,12 +37,12 @@
 
   <script>
     let scene, camera, renderer, xrSession, controller1, controller2;
-    let ball, ballCore, ballGlow, ballLight;
+    let ball, ballCore, ballGlow, ballLight, ballHot;
     let velocity = new THREE.Vector3();
     let mode = 'idle';            // 'idle' | 'attracted' | 'free'
     let orbitAngle = 0, targetController = null;
     let isPreview = false, idleTime = 0;
-    const spirals = [];
+    const flames = [];
     const tempVec = new THREE.Vector3();
     const homePos = new THREE.Vector3(0, 1.3, -1.0);
 
@@ -133,6 +133,13 @@
       });
       ballCore = new THREE.Mesh(new THREE.IcosahedronGeometry(0.1, 5), coreMat);
       group.add(ballCore);
+
+      // White-hot molten core peeking through the flames
+      ballHot = new THREE.Mesh(
+        new THREE.SphereGeometry(0.07, 20, 20),
+        new THREE.MeshBasicMaterial({ color: 0xfff0cc, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false })
+      );
+      group.add(ballHot);
 
       // Additive fresnel glow halo
       const glowMat = new THREE.ShaderMaterial({
@@ -295,53 +302,112 @@
         2.5 + Math.random() * 1.5,
         Math.cos(orbitAngle) * speed - 2.0
       );
-      spawnSpirals(6, ball.position);
+      flameBurst(ball.position, 18, true);
     }
 
-    /* ---------- SNAKE SPIRALS ---------- */
-    class SnakeSpiral {
-      constructor(startPos) {
-        this.points = [startPos.clone(), startPos.clone().add(new THREE.Vector3(0,0.01,0))];
-        this.angle = Math.random() * Math.PI * 2;
-        this.angleSpeed = (0.18 + Math.random() * 0.35) * (Math.random() < 0.5 ? 1 : -1);
-        this.maxPoints = 70; this.opacity = 1.0; this.hueShift = Math.random() * 0.18;
+    /* ---------- FLAME JETS ---------- */
+    // A flame jet: a head that shoots outward (flames rise + drift) trailing a
+    // tapered, flame-coloured tube behind it. It spreads — it does NOT coil.
+    const FLAME_VERT = `
+      varying float vT; uniform float uTime, uRadius;
+      void main(){
+        vT = uv.x;                                   // 0 = head, 1 = tail
+        float taper = mix(1.3, 0.06, uv.x);          // fat near head, thin at tail
+        vec3 center = position - normal * uRadius;   // tube centre-line
+        vec3 p = center + normal * (uRadius * taper);
+        p += normal * sin(uTime*18.0 + uv.x*34.0) * uRadius * 0.45; // flame flicker/wiggle
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(p,1.0);
+      }`;
+    const FLAME_FRAG = `
+      varying float vT; uniform float uTime, uOpacity, uSeed;
+      void main(){
+        float t = vT;
+        vec3 white  = vec3(1.0, 0.95, 0.75);
+        vec3 yellow = vec3(1.0, 0.72, 0.18);
+        vec3 orange = vec3(1.0, 0.34, 0.03);
+        vec3 red    = vec3(0.45, 0.03, 0.0);
+        vec3 col = mix(white, yellow, smoothstep(0.0, 0.18, t));
+        col = mix(col, orange, smoothstep(0.15, 0.5, t));
+        col = mix(col, red,    smoothstep(0.5, 1.0, t));
+        float flick = 0.7 + 0.3*sin(uTime*26.0 + uSeed + t*42.0);
+        float alpha = uOpacity * pow(1.0 - t, 1.25) * flick;
+        gl_FragColor = vec4(col * (2.7 - t*2.0), alpha);
+      }`;
+
+    class FlameJet {
+      constructor(origin, dir, opts) {
+        opts = opts || {};
+        this.dir = dir.clone().normalize();
+        this.speed = opts.speed != null ? opts.speed : (1.4 + Math.random() * 1.2);
+        this.maxPoints = opts.maxPoints || 22;
+        this.radius = opts.radius != null ? opts.radius : (0.03 + Math.random() * 0.015);
+        this.fade = opts.fade != null ? opts.fade : (0.016 + Math.random() * 0.012);
+        this.buoyancy = opts.buoyancy != null ? opts.buoyancy : 0.7;
+        this.opacity = 1; this.age = 0;
+        this.points = [origin.clone(), origin.clone().addScaledVector(this.dir, 0.002)];
+        // gentle, slowly-changing curl about a perpendicular axis -> licking flame, not a coil
+        this.axis = new THREE.Vector3().crossVectors(this.dir, new THREE.Vector3(0, 1, 0));
+        if (this.axis.lengthSq() < 1e-4) this.axis.set(1, 0, 0);
+        this.axis.normalize();
+        this.curl = (Math.random() - 0.5) * 2.4;
         this.material = new THREE.ShaderMaterial({
-          uniforms: { uTime:{value:0}, uOpacity:{value:1}, uHueShift:{value:this.hueShift} },
-          vertexShader: `varying vec2 vUv; uniform float uTime; void main(){ vUv=uv; vec3 p=position; p+=normal*sin(uTime*12.0+position.y*22.0)*0.009; gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.0); }`,
-          fragmentShader: `
-            varying vec2 vUv; uniform float uTime,uOpacity,uHueShift;
-            vec3 hslToRgb(float h,float s,float l){
-              vec3 rgb=vec3(0.); float c=(1.-abs(2.*l-1.))*s,x=c*(1.-abs(mod(h*6.,2.)-1.)),m=l-c*.5;
-              if(h<1./6.)rgb=vec3(c,x,0.);else if(h<2./6.)rgb=vec3(x,c,0.);else if(h<3./6.)rgb=vec3(0.,c,x);
-              else if(h<4./6.)rgb=vec3(0.,x,c);else if(h<5./6.)rgb=vec3(x,0.,c);else rgb=vec3(c,0.,x);
-              return rgb+m; }
-            void main(){
-              float p=vUv.y; float i=pow(p,0.55); float f=0.75+0.25*sin(uTime*18.+vUv.y*35.);
-              i*=f; float h=0.04+uHueShift+(1.-p)*0.13;
-              vec3 col=hslToRgb(h,1.,0.58+i*0.42);
-              gl_FragColor=vec4(col*(i*3.8+1.6), uOpacity*i*0.95); }`,
-          transparent:true, blending:THREE.AdditiveBlending, side:THREE.DoubleSide, depthWrite:false
+          uniforms: { uTime: { value: 0 }, uOpacity: { value: 1 }, uRadius: { value: this.radius }, uSeed: { value: Math.random() * 6.283 } },
+          vertexShader: FLAME_VERT, fragmentShader: FLAME_FRAG,
+          transparent: true, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false
         });
         this.curve = new THREE.CatmullRomCurve3(this.points);
-        this.mesh = new THREE.Mesh(new THREE.TubeGeometry(this.curve, 32, 0.08, 8, false), this.material);
+        this.mesh = new THREE.Mesh(this._geo(), this.material);
         scene.add(this.mesh);
       }
+      _geo() { return new THREE.TubeGeometry(this.curve, Math.max(2, this.points.length - 1), this.radius, 6, false); }
       update(delta) {
-        if (this.points.length < this.maxPoints) {
-          const last = this.points[this.points.length - 1];
-          this.angle += this.angleSpeed;
-          this.points.push(last.clone().add(new THREE.Vector3(Math.cos(this.angle)*0.065, -0.012, Math.sin(this.angle)*0.065)));
-          this.curve.points = this.points;
-          this.mesh.geometry.dispose();
-          this.mesh.geometry = new THREE.TubeGeometry(this.curve, 32, 0.08, 8, false);
-        }
-        this.opacity -= 0.009;
+        this.age += delta;
+        // steer the head: slow curl + buoyancy (flames rise)
+        this.dir.applyAxisAngle(this.axis, this.curl * delta);
+        this.dir.y += this.buoyancy * delta;
+        this.dir.normalize();
+        const sp = this.speed * (1 + Math.sin(this.age * 6) * 0.25);
+        this.points[0].addScaledVector(this.dir, sp * delta);
+        // trailing segments lag behind the head -> stretched, spreading streak
+        const a = 1 - Math.exp(-14 * delta);
+        for (let i = 1; i < this.points.length; i++) this.points[i].lerp(this.points[i - 1], a);
+        if (this.points.length < this.maxPoints) this.points.push(this.points[this.points.length - 1].clone());
+        this.speed *= Math.max(0, 1 - 2.0 * delta);
+        this.opacity -= this.fade * delta * 60;
+        this.curve.points = this.points;
+        this.mesh.geometry.dispose();
+        this.mesh.geometry = this._geo();
         this.material.uniforms.uTime.value += delta;
         this.material.uniforms.uOpacity.value = Math.max(0, this.opacity);
         return this.opacity > 0;
       }
+      dispose() { scene.remove(this.mesh); this.mesh.geometry.dispose(); this.material.dispose(); }
     }
-    function spawnSpirals(n, pos) { for (let i = 0; i < n; i++) spirals.push(new SnakeSpiral(pos)); }
+
+    function randDir() {
+      const u = Math.random() * 2 - 1, a = Math.random() * 6.2831853, s = Math.sqrt(Math.max(0, 1 - u * u));
+      return new THREE.Vector3(s * Math.cos(a), u, s * Math.sin(a));
+    }
+    // Burst of flames firing out in ALL directions (release / wall & floor impacts)
+    function flameBurst(pos, count, big) {
+      for (let i = 0; i < count; i++) {
+        if (flames.length > 80) break;
+        flames.push(new FlameJet(pos, randDir(), big
+          ? { speed: 2.2 + Math.random() * 1.6, maxPoints: 26, radius: 0.04 + Math.random() * 0.02, fade: 0.013 }
+          : { speed: 1.5 + Math.random() * 1.2, maxPoints: 20, radius: 0.03 + Math.random() * 0.015, fade: 0.018 }));
+      }
+    }
+    // Continuous licking flames so the ball is always visibly ablaze (rise upward)
+    let emitAcc = 0;
+    function emitFlames(pos, delta) {
+      emitAcc += delta;
+      while (emitAcc > 0.045) {
+        emitAcc -= 0.045;
+        if (flames.length > 55) break;
+        const d = randDir(); d.y = Math.abs(d.y) * 0.5 + 0.5; d.normalize();
+        flames.push(new FlameJet(pos, d, { speed: 0.8 + Math.random() * 0.6, maxPoints: 12, radius: 0.02 + Math.random() * 0.012, fade: 0.03 + Math.random() * 0.02, buoyancy: 1.3 }));
+      }
+    }
 
     /* ---------- REAL-WORLD PLANES + COLLISION ---------- */
     // Rebuild colliders from the headset's detected real-world planes each frame.
@@ -380,7 +446,7 @@
           vel.addScaledVector(_n, -1.6 * vn); // bounce, restitution 0.6
           vel.multiplyScalar(0.82);           // friction
           pos.addScaledVector(_n, radius - d); // push out of surface
-          spawnSpirals(5, pos);
+          flameBurst(pos, 12, false);
           return _n.clone();
         }
       }
@@ -443,8 +509,14 @@
         ball.position.lerp(target, 1 - Math.exp(-3 * delta));
       }
 
-      for (let i = spirals.length - 1; i >= 0; i--) {
-        if (!spirals[i].update(delta)) { scene.remove(spirals[i].mesh); spirals[i].mesh.geometry.dispose(); spirals.splice(i, 1); }
+      // the ball is always ablaze: continuously emit licking flames from it
+      emitFlames(ball.position, delta);
+
+      // pulse the white-hot core
+      ballHot.material.opacity = 0.8 + Math.sin(t * 20) * 0.12;
+
+      for (let i = flames.length - 1; i >= 0; i--) {
+        if (!flames[i].update(delta)) { flames[i].dispose(); flames.splice(i, 1); }
       }
 
       renderer.render(scene, camera);
