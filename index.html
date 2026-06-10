@@ -71,6 +71,7 @@
     const homePos = new THREE.Vector3(0, 1.3, -1.0);
     const UP = new THREE.Vector3(0, 1, 0);
     const ballRadius = 0.1;
+    const CRUISE_SPEED = 1.0; // the ball never drops below this — perpetual motion
 
     const snakes = [];
     let surfCount = 0, airCount = 0;
@@ -330,6 +331,11 @@
       ballHot.visible = true;
       for (let i = 0; i < 5; i++) spawnAirFlame(ball.position, true);
       emberBurst(ball.position, 14);
+      // set the fire loose — from here on it never rests
+      // (in AR the grab on this same trigger press takes over immediately)
+      mode = 'free';
+      velocity.set(Math.random() - 0.5, 0.3, Math.random() - 0.5)
+        .normalize().multiplyScalar(CRUISE_SPEED);
       hintEl.textContent = isPreview
         ? 'Drag to look, click to throw the fire. Watch the snakes hit the floor, find the walls, and climb.'
         : 'Hold trigger to attract the fire — flick & release to throw. Snakes of flame climb your real walls 🔥';
@@ -917,8 +923,8 @@
         const vn = vel.dot(_n);
         if (vn < 0) {
           const impactSpeed = -vn;
-          vel.addScaledVector(_n, -1.6 * vn);  // restitution 0.6
-          vel.multiplyScalar(0.84);            // friction
+          vel.addScaledVector(_n, -1.8 * vn);  // restitution 0.8 — lively, like the original
+          if (impactSpeed > 0.25) vel.multiplyScalar(0.96); // a whisper of friction on real hits
           pos.addScaledVector(_n, r - d);
           return { plane: c, normal: _n.clone(), speed: impactSpeed };
         }
@@ -1131,10 +1137,11 @@
         }
       }
 
-      // preview auto-demo once lit, until the user clicks
+      // preview auto-demo once lit, until the user clicks: the ball cruises
+      // on its own now, so the demo just throws it afresh every so often
       if (isPreview && lit && !userInteracted) {
         demoT += dt;
-        if (mode === 'idle' && demoT > 2.0) { orbitAngle = 0; mode = 'attracted'; targetController = null; demoT = 0; }
+        if (mode === 'free' && demoT > 7.0) { orbitAngle = 0; mode = 'attracted'; targetController = null; demoT = 0; }
         else if (mode === 'attracted' && demoT > 2.4) {
           ctrlVel.set((Math.random() - 0.5) * 5, 0.8 + Math.random() * 1.6, -2 - Math.random() * 3);
           release(); demoT = 0;
@@ -1165,24 +1172,33 @@
         ballCore.material.uniforms.uHeat.value = 1.5;
       } else if (mode === 'free') {
         ballCore.material.uniforms.uHeat.value = 1.1;
-        velocity.y -= 9.8 * dt;
+        // gravity fades as the ball slows: hard throws arc and slam, but a
+        // slowing fireball turns buoyant and drifts — it never comes to rest
+        const sp = velocity.length();
+        velocity.y -= 9.8 * THREE.MathUtils.smoothstep(sp, 1.2, 4.0) * dt;
+        if (sp < CRUISE_SPEED) {
+          if (sp < 0.05) {
+            velocity.set(Math.random() - 0.5, 0.2 + Math.random() * 0.3, Math.random() - 0.5)
+              .normalize().multiplyScalar(CRUISE_SPEED);
+          } else {
+            velocity.multiplyScalar(1 + 0.6 * dt); // gently regain cruising speed
+          }
+        }
         ball.position.addScaledVector(velocity, dt);
         const hit = collideBall(ball.position, velocity, ballRadius);
-        if (hit) {
+        if (hit && hit.speed > 0.25) {
           // impact point on the surface
           _v.copy(ball.position).addScaledVector(hit.normal, -ballRadius);
           spawnImpactSnakes(hit.plane, _v, hit.speed);
           emberBurst(_v, Math.min(20, 8 + Math.floor(hit.speed * 3)));
           bounceSound(_v, hit.normal, hit.speed);
-          if (hit.normal.y > 0.5 && velocity.length() < 1.2) {
-            mode = 'idle'; idleTime = 0; velocity.set(0, 0, 0);
-          }
         }
-        if (ball.position.y < -3) {
-          mode = 'idle'; idleTime = 0; velocity.set(0, 0, 0);
+        if (ball.position.y < -3) { // escaped the room: re-enter, keep moving
           ball.position.copy(homePos);
+          velocity.set(Math.random() - 0.5, 0.1, Math.random() - 0.5)
+            .normalize().multiplyScalar(1.5);
         }
-      } else { // idle: bob gently and drift home
+      } else { // idle: pre-ignition only — hover at home until the match strikes
         ballCore.material.uniforms.uHeat.value = 1.0;
         idleTime += dt;
         tempVec.copy(homePos);
