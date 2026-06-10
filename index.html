@@ -421,50 +421,41 @@
 
     function makeFireBall() {
       const group = new THREE.Group();
+      // bright molten fire core — one noise lookup, no vertex displacement.
+      // The palette never bottoms out near black: the dimmest tone is a
+      // glowing orange so the ball always reads as lit and hot.
       const coreMat = new THREE.ShaderMaterial({
         uniforms: { uTime: { value: 0 }, uHeat: { value: 1.0 } },
-        vertexShader: NOISE_GLSL + `
-          uniform float uTime, uHeat;
+        vertexShader: `
           varying vec3 vPos;
-          void main(){
-            vPos = position;
-            vec3 n = normalize(position);
-            // displaced flame tongues: the silhouette writhes instead of
-            // reading as a perfect sphere, with taller licks toward the top
-            float upBias = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
-            float disp = fbm(n * 2.6 + vec3(0.0, -uTime * 1.1, 0.0));
-            float amp = (0.012 + 0.045 * upBias) * min(uHeat, 1.5);
-            vec3 p = position + n * (disp * amp + max(disp, 0.0) * amp * upBias);
-            gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
-          }`,
+          void main(){ vPos = position;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
         fragmentShader: NOISE_GLSL + `
           uniform float uTime, uHeat; varying vec3 vPos;
           void main(){
-            vec3 q = vPos*4.0;
-            q.y -= uTime*1.6;
-            float n = fbm(q + vec3(0.0, uTime*0.4, 0.0));
-            float n2 = fbm(vPos*8.0 + uTime*0.8);
-            float heat = (n*0.6 + n2*0.4)*0.5 + 0.6;
-            heat = clamp(heat*uHeat, 0.0, 1.6);
-            vec3 col = vec3(0.30,0.015,0.0);
-            col = mix(col, vec3(0.95,0.16,0.0), smoothstep(0.30,0.72,heat));
-            col = mix(col, vec3(1.0,0.52,0.05), smoothstep(0.68,1.05,heat));
-            col = mix(col, vec3(1.0,0.80,0.28), smoothstep(1.05,1.50,heat));
-            gl_FragColor = vec4(col*1.7, 1.0);
+            vec3 q = vPos * 5.0;
+            q.y -= uTime * 1.6;                 // flames lick upward
+            float heat = clamp((fbm(q) * 0.5 + 0.65) * uHeat, 0.0, 1.7);
+            vec3 col = vec3(1.0, 0.32, 0.03);                                   // glowing orange floor
+            col = mix(col, vec3(1.0, 0.55, 0.08), smoothstep(0.45, 0.85, heat));
+            col = mix(col, vec3(1.0, 0.80, 0.28), smoothstep(0.85, 1.25, heat));
+            col = mix(col, vec3(1.0, 0.95, 0.65), smoothstep(1.25, 1.65, heat)); // white-hot peaks
+            // exposure: dark smoldering ember before ignition, full blaze once lit
+            float expo = smoothstep(0.15, 0.7, uHeat);
+            gl_FragColor = vec4(col * 1.45 * mix(0.16, 1.0, expo), 1.0);
           }`,
       });
-      ballCore = new THREE.Mesh(new THREE.IcosahedronGeometry(0.1, 5), coreMat);
+      ballCore = new THREE.Mesh(new THREE.IcosahedronGeometry(0.1, 3), coreMat);
       group.add(ballCore);
 
       ballHot = new THREE.Mesh(
         new THREE.SphereGeometry(0.06, 16, 16),
-        new THREE.MeshBasicMaterial({ color: 0xffaa44, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false })
+        new THREE.MeshBasicMaterial({ color: 0xffcc66, transparent: true, opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false })
       );
       group.add(ballHot);
 
-      // corona: a camera-facing quad with a noise-driven wavy rim and
-      // internal flame texture — irregular, alive, drifting upward, in
-      // place of the old uniform fresnel shell
+      // corona: a camera-facing additive glow — a clean radial falloff with a
+      // single noise lookup gently rippling the rim. Cheap and bright.
       const coronaMat = new THREE.ShaderMaterial({
         uniforms: { uTime: { value: 0 }, uHeat: { value: 1.0 } },
         transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
@@ -477,28 +468,20 @@
           varying vec2 vUv;
           void main(){
             vec2 p = vUv * 2.0 - 1.0;
-            p.y -= 0.10;                       // glow reaches higher than it hangs
+            p.y -= 0.08;                        // reaches a touch higher than it hangs
             float r = length(p);
             if (r > 1.0) discard;
             float ang = atan(p.y, p.x);
-            // wavy, licking rim — two noise octaves on the angle
-            vec3 q = vec3(cos(ang), sin(ang), 0.0) * 1.6;
-            float rim  = fbm(q + vec3(0.0, 0.0, uTime * 0.8));
-            float rim2 = fbm(q * 2.3 + vec3(0.0, uTime * 1.4, 7.0));
-            float maxR = 0.55 + rim * 0.28 + rim2 * 0.12;
-            // internal texture rises like heat
-            float tex = fbm(vec3(p * 2.8, uTime * 0.9) + vec3(0.0, -uTime * 1.3, 0.0)) * 0.5 + 0.5;
-            float fall = pow(clamp(1.0 - r / max(maxR, 0.2), 0.0, 1.0), 1.7);
-            float glow = fall * (0.45 + 0.75 * tex) * uHeat;
-            glow += pow(max(1.0 - r * 2.6, 0.0), 2.0) * 0.8; // hot kiss at the centre
-            vec3 col = vec3(1.0, 0.30, 0.02);
-            col = mix(col, vec3(1.0, 0.55, 0.08), clamp(fall * 1.4, 0.0, 1.0));
-            col = mix(col, vec3(1.0, 0.85, 0.35), pow(fall, 2.5));
-            float flick = 0.88 + 0.12 * sin(uTime * 23.0) * sin(uTime * 7.3 + 1.7);
-            gl_FragColor = vec4(col * glow * flick, glow);
+            float ripple = fbm(vec3(cos(ang), sin(ang), uTime * 0.7) * 1.4);
+            float maxR = 0.62 + ripple * 0.22;
+            float fall = pow(clamp(1.0 - r / maxR, 0.0, 1.0), 1.6);
+            float glow = fall * uHeat;
+            vec3 col = mix(vec3(1.0, 0.36, 0.04), vec3(1.0, 0.75, 0.30), pow(fall, 2.0));
+            float flick = 0.9 + 0.1 * sin(uTime * 16.0);
+            gl_FragColor = vec4(col * glow * flick, glow * 0.9);
           }`,
       });
-      ballGlow = new THREE.Mesh(new THREE.PlaneGeometry(0.62, 0.62), coronaMat);
+      ballGlow = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.6), coronaMat);
       group.add(ballGlow);
 
       group.position.copy(homePos);
