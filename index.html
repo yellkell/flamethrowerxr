@@ -426,6 +426,12 @@
       // glowing orange so the ball always reads as lit and hot.
       const coreMat = new THREE.ShaderMaterial({
         uniforms: { uTime: { value: 0 }, uHeat: { value: 1.0 } },
+        // transparent:true (at alpha 1) moves the core into the transparent
+        // pass ABOVE the fullscreen darkness — as an opaque object it was
+        // drawn first and the tint painted 84% black over it, which is why
+        // the heart of the ball looked dim while the additive effects around
+        // it (drawn after the tint) looked perfect
+        transparent: true, depthWrite: true,
         vertexShader: `
           varying vec3 vPos;
           void main(){ vPos = position;
@@ -446,12 +452,14 @@
           }`,
       });
       ballCore = new THREE.Mesh(new THREE.IcosahedronGeometry(0.1, 3), coreMat);
+      ballCore.renderOrder = 1; // above the tint (-1), below the additive layers
       group.add(ballCore);
 
       ballHot = new THREE.Mesh(
         new THREE.SphereGeometry(0.072, 16, 16),
         new THREE.MeshBasicMaterial({ color: 0xffdd88, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending, depthWrite: false })
       );
+      ballHot.renderOrder = 2;
       group.add(ballHot);
 
       // corona: a camera-facing additive glow — a clean radial falloff with a
@@ -483,6 +491,7 @@
           }`,
       });
       ballGlow = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.6), coronaMat);
+      ballGlow.renderOrder = 2; // draws after the core so the glow layers over it
       group.add(ballGlow);
 
       group.position.copy(homePos);
