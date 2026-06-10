@@ -60,6 +60,14 @@
     let mode = 'idle';            // 'idle' | 'attracted' | 'free'
     let orbitAngle = 0, targetController = null;
     let isPreview = false, idleTime = 0;
+
+    // ignition arc: the room starts near-black, the title hovers mid-room,
+    // and the first trigger pull strikes the match and lights the ball
+    let lit = false;
+    const TINT_START = 0.97, TINT_INTRO = 0.78, TINT_LIT = 0.60;
+    let tintLevel = TINT_START;
+    let tintMat = null, tintMesh = null;
+    let titleSprite = null, titleMat = null, titleT = 0, titleGone = false;
     const homePos = new THREE.Vector3(0, 1.3, -1.0);
     const UP = new THREE.Vector3(0, 1, 0);
     const ballRadius = 0.1;
@@ -255,6 +263,78 @@
       });
     }
 
+    // the original's four-phase match strike: scratch, ignition pop,
+    // rising flame whoosh, sub-bass body thump
+    function matchStrike() {
+      if (!AC) return;
+      const t = AC.currentTime;
+      const sc = AC.createBufferSource();
+      sc.buffer = makeNoise(0.13, p => Math.pow(1 - p, 0.3) * (p < 0.1 ? p / 0.1 : 1));
+      const hp = AC.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.setValueAtTime(2500, t);
+      const sg = AC.createGain();
+      sg.gain.setValueAtTime(0.5, t);
+      sg.gain.exponentialRampToValueAtTime(0.001, t + 0.13);
+      sc.connect(hp); hp.connect(sg);
+      routeOut(sg, 0);
+      sc.start(t);
+
+      const pop = AC.createOscillator();
+      pop.type = 'sine';
+      pop.frequency.setValueAtTime(220, t + 0.08);
+      pop.frequency.exponentialRampToValueAtTime(60, t + 0.22);
+      const pg = AC.createGain();
+      pg.gain.setValueAtTime(0, t + 0.08);
+      pg.gain.linearRampToValueAtTime(0.55, t + 0.11);
+      pg.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+      pop.connect(pg);
+      routeOut(pg, 0);
+      pop.start(t + 0.08); pop.stop(t + 0.38);
+
+      const wh = AC.createBufferSource();
+      wh.buffer = makeNoise(1.1, p => (p < 0.15 ? p / 0.15 : 1) * Math.pow(1 - p * 0.6, 0.8));
+      const bp = AC.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.Q.setValueAtTime(0.6, t + 0.1);
+      bp.frequency.setValueAtTime(200, t + 0.1);
+      bp.frequency.exponentialRampToValueAtTime(1200, t + 0.45);
+      bp.frequency.exponentialRampToValueAtTime(600, t + 1.2);
+      const wg = AC.createGain();
+      wg.gain.setValueAtTime(0, t + 0.1);
+      wg.gain.linearRampToValueAtTime(0.6, t + 0.35);
+      wg.gain.exponentialRampToValueAtTime(0.22, t + 1.0);
+      wg.gain.exponentialRampToValueAtTime(0.001, t + 1.25);
+      wh.connect(bp); bp.connect(wg);
+      routeOut(wg, 0);
+      wh.start(t + 0.1);
+
+      const body = AC.createOscillator();
+      body.type = 'sine';
+      body.frequency.setValueAtTime(80, t + 0.09);
+      body.frequency.exponentialRampToValueAtTime(40, t + 0.4);
+      const bg = AC.createGain();
+      bg.gain.setValueAtTime(0, t + 0.09);
+      bg.gain.linearRampToValueAtTime(0.45, t + 0.14);
+      bg.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+      body.connect(bg);
+      routeOut(bg, 0);
+      body.start(t + 0.09); body.stop(t + 0.52);
+    }
+
+    function ignite() {
+      if (lit) return;
+      lit = true;
+      matchStrike();
+      ballGlow.visible = true;
+      ballHot.visible = true;
+      for (let i = 0; i < 5; i++) spawnAirFlame(ball.position, true);
+      emberBurst(ball.position, 14);
+      hintEl.textContent = isPreview
+        ? 'Drag to look, click to throw the fire. Watch the snakes hit the floor, find the walls, and climb.'
+        : 'Hold trigger to attract the fire — flick & release to throw. Snakes of flame climb your real walls 🔥';
+    }
+
     /* ================= FIRE BALL ================= */
     const NOISE_GLSL = `
       vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}
@@ -445,6 +525,32 @@
       depthWrite: false, side: THREE.DoubleSide
     });
 
+    // "FLAME THROWER" hovering in the middle of the darkened room
+    function makeTitle() {
+      const c = document.createElement('canvas');
+      c.width = 1024; c.height = 320;
+      const g = c.getContext('2d');
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.shadowColor = 'rgba(255,85,0,0.9)';
+      g.shadowBlur = 40;
+      g.fillStyle = '#ffd9a0';
+      g.font = 'bold 110px sans-serif';
+      g.fillText('FLAME THROWER', 512, 125);
+      g.shadowBlur = 18;
+      g.fillStyle = 'rgba(255,170,80,0.85)';
+      g.font = '40px sans-serif';
+      g.fillText('take your time', 512, 245);
+      titleMat = new THREE.SpriteMaterial({
+        map: new THREE.CanvasTexture(c), transparent: true,
+        opacity: 0, depthWrite: false
+      });
+      titleSprite = new THREE.Sprite(titleMat);
+      titleSprite.position.set(0, 1.5, -1.6);
+      titleSprite.scale.set(2.0, 0.625, 1);
+      scene.add(titleSprite);
+    }
+
     function makeGlowTexture() {
       const c = document.createElement('canvas');
       c.width = c.height = 64;
@@ -477,7 +583,7 @@
         this.u = u; this.v = v;
         this.spawnU = u; this.spawnV = v;
         this.air = !!opts.air;
-        this.max = opts.maxPoints || 56;
+        this.max = opts.maxPoints || 72;
         const boost = opts.boost || 0;
 
         // --- the original spiral's soul, retuned from px/frame to m/s ---
@@ -485,9 +591,9 @@
         this.flicker = 9 + Math.random() * 16;       // turn-rate pulse freq (rad/s)
         this.spread = 0.4 + Math.random() * 0.5;     // speed pulse depth
         this.speed = (this.air ? 0.40 + Math.random() * 0.25
-                               : 0.55 + Math.random() * 0.35) * (1 + boost * 0.3);
-        this.climb = opts.climb != null ? opts.climb : (0.45 + Math.random() * 0.2);
-        this.fade = opts.fade || (0.30 + Math.random() * 0.18); // opacity/sec
+                               : 0.62 + Math.random() * 0.38) * (1 + boost * 0.3);
+        this.climb = opts.climb != null ? opts.climb : (0.5 + Math.random() * 0.25);
+        this.fade = opts.fade || (0.22 + Math.random() * 0.13); // opacity/sec
         this.hue = 10 + Math.random() * 48;
         this.width = opts.width || (0.045 + Math.random() * 0.03 + boost * 0.012);
         this.lift = 0.012 + Math.random() * 0.008;   // hover off the surface
@@ -865,9 +971,25 @@
       glowTex = makeGlowTexture();
       ball = makeFireBall();
       scene.add(ball);
+      // dormant until the match is struck: just the dark smoldering core
+      ballGlow.visible = false;
+      ballHot.visible = false;
       pool = new ParticlePool(1600);
       scene.add(pool.points);
       colliders = defaultRoom();
+
+      // darkening dome around the player — dims the passthrough so the fire's
+      // light owns the room; drawn first, everything additive glows on top
+      tintMat = new THREE.MeshBasicMaterial({
+        color: 0x000000, transparent: true, opacity: TINT_START,
+        side: THREE.BackSide, depthWrite: false, depthTest: false
+      });
+      tintMesh = new THREE.Mesh(new THREE.SphereGeometry(40, 16, 12), tintMat);
+      tintMesh.renderOrder = -1;
+      tintMesh.frustumCulled = false;
+      scene.add(tintMesh);
+
+      makeTitle();
 
       if (preview) initPreview();
       else await initXR();
@@ -878,7 +1000,7 @@
 
     /* ================= AR ================= */
     async function initXR() {
-      hintEl.textContent = 'Hold trigger to attract the fire — flick & release to throw. Snakes of flame climb your real walls 🔥';
+      hintEl.textContent = 'Squeeze the trigger to strike the match 🔥';
       renderer.xr.enabled = true;
       try {
         xrSession = await navigator.xr.requestSession('immersive-ar', {
@@ -893,7 +1015,7 @@
           const g = new THREE.BufferGeometry().setFromPoints(
             [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -0.4)]);
           c.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xff7700 })));
-          c.addEventListener('selectstart', () => grab(c));
+          c.addEventListener('selectstart', () => { ignite(); grab(c); });
           c.addEventListener('selectend', release);
           scene.add(c);
           scene.add(renderer.xr.getControllerGrip(i));
@@ -908,7 +1030,7 @@
     let camYaw = 0, camPitch = 0, dragging = false, lastX = 0, lastY = 0;
     let downTime = 0, downX = 0, downY = 0, demoT = 0;
     function initPreview() {
-      hintEl.textContent = 'Preview — drag to look, click to throw the fire. Watch the snakes hit the floor, find the walls, and climb. (Open on a Quest for real AR.)';
+      hintEl.textContent = 'Preview — click to strike the match. (Open on a Quest for real AR.)';
       const grid = new THREE.GridHelper(10, 20, 0xff6600, 0x331100);
       grid.material.opacity = 0.35; grid.material.transparent = true;
       scene.add(grid);
@@ -932,6 +1054,7 @@
         dragging = false;
         const moved = Math.hypot(e.clientX - downX, e.clientY - downY);
         if (performance.now() - downTime < 250 && moved < 8) {
+          if (!lit) { ignite(); return; } // first click strikes the match
           // quick click: throw the fire toward the clicked point
           userInteracted = true;
           const ndc = new THREE.Vector2(
@@ -980,8 +1103,36 @@
 
       if (!isPreview && frame) updatePlanes(frame, dt);
 
-      // preview auto-demo until the user clicks
-      if (isPreview && !userInteracted) {
+      // room darkness: starts near-black, eases up a little while the title
+      // hovers, then settles brighter once lit — flickering with the fire
+      const tintTarget = lit ? TINT_LIT : TINT_INTRO;
+      tintLevel += (tintTarget - tintLevel) * (1 - Math.exp(-(lit ? 1.5 : 0.45) * dt));
+      let fireGlow = 0;
+      if (lit) {
+        fireGlow = Math.min(0.10, surfCount * 0.006 + airCount * 0.004)
+          + 0.02 * Math.sin(t * 13) + 0.015 * Math.sin(t * 7.7);
+      }
+      tintMat.opacity = THREE.MathUtils.clamp(tintLevel - fireGlow, 0.3, TINT_START);
+      tintMesh.position.setFromMatrixPosition(camera.matrixWorld);
+
+      // hovering title: fade in while dark, drift gently, burn away once lit
+      if (!titleGone) {
+        titleT += dt;
+        titleSprite.position.y = 1.5 + Math.sin(titleT * 1.2) * 0.04;
+        if (!lit) {
+          titleMat.opacity = Math.min(0.95, (titleT / 2.5) * 0.95);
+        } else {
+          titleMat.opacity -= (dt / 1.2) * 0.95;
+          if (titleMat.opacity <= 0) {
+            scene.remove(titleSprite);
+            titleMat.dispose();
+            titleGone = true;
+          }
+        }
+      }
+
+      // preview auto-demo once lit, until the user clicks
+      if (isPreview && lit && !userInteracted) {
         demoT += dt;
         if (mode === 'idle' && demoT > 2.0) { orbitAngle = 0; mode = 'attracted'; targetController = null; demoT = 0; }
         else if (mode === 'attracted' && demoT > 2.4) {
@@ -1039,12 +1190,17 @@
         ball.position.lerp(tempVec, 1 - Math.exp(-3 * dt));
       }
 
-      // the ball is always ablaze: licking tongues + a drizzle of embers
-      emitAcc += dt * (mode === 'attracted' ? 1.7 : 1);
-      while (emitAcc > 0.14) {
-        emitAcc -= 0.14;
-        spawnAirFlame(ball.position, false);
-        if (Math.random() < 0.6) spawnEmber(ball.position, 0.5);
+      // dormant before the match strikes: a dark, faintly smoldering ember
+      if (!lit) ballCore.material.uniforms.uHeat.value = 0.18;
+
+      // once lit the ball is always ablaze: licking tongues + a drizzle of embers
+      if (lit) {
+        emitAcc += dt * (mode === 'attracted' ? 1.7 : 1);
+        while (emitAcc > 0.14) {
+          emitAcc -= 0.14;
+          spawnAirFlame(ball.position, false);
+          if (Math.random() < 0.6) spawnEmber(ball.position, 0.5);
+        }
       }
 
       for (let i = snakes.length - 1; i >= 0; i--) {
