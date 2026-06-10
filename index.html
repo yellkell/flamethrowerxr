@@ -89,6 +89,7 @@
     const _p = new THREE.Vector3();
     const _v = new THREE.Vector3();
     const _hand = new THREE.Vector3();
+    const _cv = new THREE.Vector3();
     const _c = new THREE.Color();
     const tempVec = new THREE.Vector3();
 
@@ -589,6 +590,8 @@
         this.u = u; this.v = v;
         this.spawnU = u; this.spawnV = v;
         this.air = !!opts.air;
+        this.driven = !!opts.driven; // head pinned to the ball — sparkler drawing
+        this.target = null;
         this.max = opts.maxPoints || 72;
         const boost = opts.boost || 0;
 
@@ -682,9 +685,45 @@
         return false;
       }
 
+      // let go of a sparkler trail: the drawing comes alive and slithers off
+      // as a wild rising air snake from wherever the stroke ended
+      releaseDriven() {
+        if (!this.driven) return;
+        this.driven = false;
+        this.target = null;
+        this.plane = airPlaneAt(this.pts[0]);
+        this.u = 0; this.v = 0;
+        this._computeUp();
+        this.angle = Math.atan2(this.upV, this.upU) + (Math.random() - 0.5) * 1.2;
+        this.climb = 0.7;
+        this.speed = 0.5;
+        this.fade = 0.45;
+      }
+
       update(dt) {
         this.age += dt;
         const F = dt * 60; // frames at 60fps baseline
+
+        if (this.driven) {
+          // sparkler mode: head chases the orbiting ball with a touch of silk
+          if (this.target) this.pts[0].lerp(this.target, 1 - Math.pow(0.45, F));
+          // ribbon faces the viewer while drawn in mid-air
+          _cv.setFromMatrixPosition(camera.matrixWorld);
+          this.nrm[0].subVectors(_cv, this.pts[0]).normalize();
+          this._updateTail(F);
+          // sparks crackle off the tip, and bright motes linger along the stroke
+          if (Math.random() < 10 * dt) spawnEmber(this.pts[0], 0.15);
+          this.resAcc += dt;
+          if (this.resAcc > 0.06) {
+            this.resAcc = 0;
+            _c.setHSL(THREE.MathUtils.euclideanModulo(this.hue, 360) / 360, 1, 0.5);
+            pool.spawn(this.pts[0],
+              (Math.random() - 0.5) * 0.05, (Math.random() - 0.5) * 0.05, (Math.random() - 0.5) * 0.05,
+              _c.r * 0.5, _c.g * 0.5, _c.b * 0.5, 1.1, 0.03, 0);
+          }
+          this._updateGeometry();
+          return true; // never fades while you're drawing with it
+        }
 
         // ---- head steering: oscillating turn rate = the writhing search ----
         this.angle += this.angleSpeed * (1 + Math.sin(this.age * this.flicker + this.ph1) * 0.8) * dt;
@@ -722,20 +761,7 @@
         this.pts[0].copy(_w);
         this.nrm[0].copy(this.plane.normal);
 
-        // ---- follower chain: each segment lerps toward the one ahead ----
-        const k = 1 - Math.pow(0.75, F);
-        for (let i = 1; i < this.pts.length; i++) {
-          this.pts[i].lerp(this.pts[i - 1], k);
-          this.nrm[i].lerp(this.nrm[i - 1], k).normalize();
-        }
-        this.growAcc += F;
-        while (this.growAcc >= 2) {
-          this.growAcc -= 2;
-          if (this.pts.length < this.max) {
-            this.pts.push(this.pts[this.pts.length - 1].clone());
-            this.nrm.push(this.nrm[this.nrm.length - 1].clone());
-          }
-        }
+        this._updateTail(F);
 
         this.opacity -= this.fade * dt;
 
@@ -754,6 +780,23 @@
 
         this._updateGeometry();
         return this.opacity > 0;
+      }
+
+      // follower chain: each segment lerps toward the one ahead, body grows
+      _updateTail(F) {
+        const k = 1 - Math.pow(0.75, F);
+        for (let i = 1; i < this.pts.length; i++) {
+          this.pts[i].lerp(this.pts[i - 1], k);
+          this.nrm[i].lerp(this.nrm[i - 1], k).normalize();
+        }
+        this.growAcc += F;
+        while (this.growAcc >= 2) {
+          this.growAcc -= 2;
+          if (this.pts.length < this.max) {
+            this.pts.push(this.pts[this.pts.length - 1].clone());
+            this.nrm.push(this.nrm[this.nrm.length - 1].clone());
+          }
+        }
       }
 
       _updateGeometry() {
@@ -835,14 +878,19 @@
       }
     }
 
-    // licking tongues of flame rising off the ball (the ball is always ablaze)
-    function spawnAirFlame(pos, big) {
-      if (airCount >= MAX_AIR_SNAKES) return;
+    // synthetic vertical plane at a point — the canvas air snakes writhe in
+    function airPlaneAt(pos) {
       const th = Math.random() * Math.PI * 2;
       const normal = new THREE.Vector3(Math.cos(th), 0, Math.sin(th));
       const xAxis = new THREE.Vector3(-Math.sin(th), 0, Math.cos(th));
       const zAxis = new THREE.Vector3().crossVectors(normal, xAxis);
-      const plane = { point: pos.clone(), normal, xAxis, zAxis, halfX: 99, halfZ: 99 };
+      return { point: pos.clone(), normal, xAxis, zAxis, halfX: 99, halfZ: 99 };
+    }
+
+    // licking tongues of flame rising off the ball (the ball is always ablaze)
+    function spawnAirFlame(pos, big) {
+      if (airCount >= MAX_AIR_SNAKES) return;
+      const plane = airPlaneAt(pos);
       const s = new FireSnake(plane, 0, 0, {
         air: true,
         maxPoints: big ? 26 : 18,
@@ -938,6 +986,7 @@
     const orbitTangent = new THREE.Vector3();
     let ctrlHasPrev = false;
     let userInteracted = false;
+    let holdTrail = null;
 
     function grab(controller) {
       mode = 'attracted';
@@ -945,8 +994,18 @@
       ctrlVel.set(0, 0, 0);
       ctrlHasPrev = false;
       igniteArp(ball.position);
+      // sparkler: the orbiting ball draws a snake spiral behind it, so you
+      // can write in the air; it stays alight as long as you hold the trigger
+      if (holdTrail) holdTrail.releaseDriven();
+      holdTrail = new FireSnake(airPlaneAt(ball.position), 0, 0, {
+        air: true, driven: true, maxPoints: 110,
+        width: 0.034 + Math.random() * 0.01
+      });
+      holdTrail.target = ball.position; // live reference — follows the orbit
+      snakes.push(holdTrail);
     }
     function release() {
+      if (holdTrail) { holdTrail.releaseDriven(); holdTrail = null; }
       if (mode !== 'attracted') return;
       mode = 'free';
       velocity.copy(ctrlVel).multiplyScalar(2.0);     // your arm's throw
