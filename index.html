@@ -892,13 +892,22 @@
         const col = this.colAttr.array;
         const hueShift = this.hue + Math.sin(this.age * 12 + this.ph3) * 15;
         const denom = Math.max(n - 1, 1);
+        let ppx = 0, ppy = 0, ppz = 0, hasPrevPerp = false;
         for (let i = 0; i < n; i++) {
           const t = i / denom;
           // ribbon direction & in-surface perpendicular
           _d.subVectors(this.pts[Math.min(i + 1, n - 1)], this.pts[Math.max(i - 1, 0)]);
           _p.crossVectors(this.nrm[i], _d);
-          if (_p.lengthSq() < 1e-10) _p.copy(this.plane.xAxis);
+          if (_p.lengthSq() < 1e-10) {
+            if (hasPrevPerp) _p.set(ppx, ppy, ppz);
+            else _p.copy(this.plane.xAxis);
+          }
           _p.normalize();
+          // keep the ribbon's sides consistent segment to segment — a sign
+          // flip would cross adjacent quads into a flashing bowtie triangle
+          if (hasPrevPerp && (_p.x * ppx + _p.y * ppy + _p.z * ppz) < 0) _p.negate();
+          ppx = _p.x; ppy = _p.y; ppz = _p.z;
+          hasPrevPerp = true;
           const halfW = this.width * (0.35 + 0.65 * Math.sin(t * Math.PI)) * 0.5 + 0.002;
           const liftOff = this.lift + Math.sin(this.age * 12 + i * 0.7 + this.ph2) * 0.004;
           const cx = this.pts[i].x + this.nrm[i].x * liftOff;
@@ -1137,18 +1146,32 @@
       scene.add(pool.points);
       colliders = defaultRoom();
 
-      // darkening dome around the player — dims the passthrough so the fire's
-      // light owns the room; drawn first, everything additive glows on top
-      tintMat = new THREE.MeshBasicMaterial({
-        color: 0x000000, transparent: true, opacity: TINT_START,
-        side: THREE.BackSide, depthWrite: false, depthTest: false
+      // darkening pass — dims the passthrough so the fire's light owns the
+      // room. A fullscreen shader quad (clip-space, ignores all matrices):
+      // covers every pixel of both eyes by construction. The previous
+      // camera-centred sphere dome could flash gaps at its pole — a bright
+      // undimmed triangle of passthrough directly overhead.
+      tintMat = new THREE.ShaderMaterial({
+        uniforms: { uOpacity: { value: TINT_START } },
+        transparent: true, depthTest: false, depthWrite: false,
+        vertexShader: `void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+        fragmentShader: `uniform float uOpacity;
+          void main(){ gl_FragColor = vec4(0.0, 0.0, 0.0, uOpacity); }`
       });
-      tintMesh = new THREE.Mesh(new THREE.SphereGeometry(40, 16, 12), tintMat);
+      tintMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), tintMat);
       tintMesh.renderOrder = -1;
       tintMesh.frustumCulled = false;
       scene.add(tintMesh);
 
       makeTitle();
+
+      // pre-compile every shader while still on the 2D page: the snake
+      // ribbon material otherwise compiles mid-session on the first spawn,
+      // and that stall drops frames — dropped frames are what let the
+      // compositor's reprojection expose the bright buffer edge
+      const warm = new FireSnake(airPlaneAt(homePos), 0, 0, { air: true });
+      renderer.compile(scene, camera);
+      warm.dispose();
 
       if (preview) initPreview();
       else await initXR();
@@ -1167,6 +1190,20 @@
         });
         await renderer.xr.setSession(xrSession);
         xrSession.addEventListener('end', () => location.reload());
+
+        // steadier frame pacing: prefer 72Hz so every frame makes the
+        // compositor deadline — a missed frame forces reprojection, which
+        // samples past the rendered FOV into alpha-0 border, and in a
+        // darkened passthrough scene that leaks a bright flash of raw
+        // passthrough at the edge of view
+        try {
+          const rates = xrSession.supportedFrameRates;
+          if (rates && rates.length && xrSession.updateTargetFrameRate) {
+            let pick = rates[0];
+            for (const r of rates) if (Math.abs(r - 72) < Math.abs(pick - 72)) pick = r;
+            xrSession.updateTargetFrameRate(pick).catch(() => { });
+          }
+        } catch (e) { }
 
         for (let i = 0; i < 2; i++) {
           const c = renderer.xr.getController(i);
@@ -1270,8 +1307,7 @@
         fireGlow = Math.min(0.10, surfCount * 0.006 + airCount * 0.004)
           + 0.02 * Math.sin(t * 13) + 0.015 * Math.sin(t * 7.7);
       }
-      tintMat.opacity = THREE.MathUtils.clamp(tintLevel - fireGlow, 0.3, TINT_START);
-      tintMesh.position.setFromMatrixPosition(camera.matrixWorld);
+      tintMat.uniforms.uOpacity.value = THREE.MathUtils.clamp(tintLevel - fireGlow, 0.3, TINT_START);
 
       // hovering title above the ball: cycles between "Take your time /
       // Flame Thrower" and "Pull the trigger to strike the match" until
