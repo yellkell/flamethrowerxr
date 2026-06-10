@@ -314,6 +314,75 @@
       });
     }
 
+    // drawing sound — the original's hold "pluck roll": a JS-scheduled
+    // arpeggiator cycling a pentatonic motif while you hold the trigger.
+    // Adapted to the room: pitch root tracks the ball's height (drawing up
+    // high plays higher) and the pan follows the ball around you live.
+    let rollGain = null, rollPan = null, rollTimer = null;
+    function startPluckRoll() {
+      if (!AC || rollGain) return;
+      const t = AC.currentTime;
+      rollGain = AC.createGain();
+      rollGain.gain.setValueAtTime(0, t);
+      rollGain.gain.linearRampToValueAtTime(0.24, t + 0.12);
+      if (typeof AC.createStereoPanner === 'function') {
+        rollPan = AC.createStereoPanner();
+        rollPan.pan.value = panOf(ball.position);
+        rollGain.connect(rollPan);
+        rollPan.connect(masterBus);
+      } else {
+        rollGain.connect(masterBus);
+      }
+      if (reverb) rollGain.connect(reverb);
+
+      // asymmetric motif reads as "played" rather than mechanical
+      const PATTERN = [0, 2, 4, 1, 3, 2, 4, 3, 2, 0, 1, 3];
+      const arpRate = 0.11;
+      let nextTime = t + 0.05;
+      let patIdx = 0;
+      const myGain = rollGain;
+      const tick = () => {
+        if (rollGain !== myGain) return; // roll was stopped
+        if (rollPan) rollPan.pan.setTargetAtTime(panOf(ball.position), AC.currentTime, 0.08);
+        const ahead = AC.currentTime + 0.28;
+        while (nextTime < ahead) {
+          const h = THREE.MathUtils.clamp(ball.position.y / 2.2, 0, 1);
+          const rootIdx = Math.min(PENT.length - 5, Math.floor(h * (PENT.length - 4)));
+          const idx = Math.min(PENT.length - 1, rootIdx + PATTERN[patIdx % PATTERN.length]);
+          const hz = PENT[idx] * (1 + (Math.random() - 0.5) * 0.004);
+          const o = AC.createOscillator();
+          o.type = 'triangle';
+          o.frequency.setValueAtTime(hz, nextTime);
+          const lp = AC.createBiquadFilter();
+          lp.type = 'lowpass';
+          lp.frequency.setValueAtTime(Math.min(5500, hz * 5 + 700), nextTime);
+          lp.Q.setValueAtTime(0.85, nextTime);
+          const g = AC.createGain();
+          const peak = (patIdx % 4 === 0) ? 0.5 : 0.32; // accent every 4th
+          g.gain.setValueAtTime(0, nextTime);
+          g.gain.linearRampToValueAtTime(peak, nextTime + 0.003);
+          g.gain.exponentialRampToValueAtTime(0.0001, nextTime + 0.22);
+          o.connect(lp); lp.connect(g); g.connect(myGain);
+          o.start(nextTime); o.stop(nextTime + 0.28);
+          nextTime += arpRate;
+          patIdx++;
+        }
+      };
+      tick();
+      rollTimer = setInterval(tick, 80);
+    }
+    function stopPluckRoll() {
+      if (!rollGain) return;
+      const t = AC.currentTime;
+      rollGain.gain.cancelScheduledValues(t);
+      rollGain.gain.setValueAtTime(rollGain.gain.value, t);
+      rollGain.gain.linearRampToValueAtTime(0, t + 0.15);
+      const g = rollGain, p = rollPan;
+      setTimeout(() => { try { g.disconnect(); if (p) p.disconnect(); } catch (e) {} }, 450);
+      clearInterval(rollTimer);
+      rollTimer = null; rollGain = null; rollPan = null;
+    }
+
     // the original's four-phase match strike: scratch, ignition pop,
     // rising flame whoosh, sub-bass body thump
     function matchStrike() {
@@ -1114,8 +1183,10 @@
       });
       holdTrail.target = ball.position; // live reference — follows the orbit
       snakes.push(holdTrail);
+      startPluckRoll();
     }
     function release() {
+      stopPluckRoll();
       if (holdTrail) { holdTrail.releaseDriven(); holdTrail = null; }
       if (mode !== 'attracted') return;
       mode = 'free';
