@@ -390,11 +390,14 @@
       rollTimer = null; rollGain = null; rollPan = null;
     }
 
-    // match strike: plays the recorded strike if it's loaded, otherwise the
-    // original's synthesized four-phase version (scratch, ignition pop,
-    // rising flame whoosh, sub-bass body thump)
+    // match strike — replicates the original exactly: the recorded
+    // match_strike.mp3 plays LAYERED with the synthesized four-phase strike
+    // (scratch, ignition pop, rising flame whoosh, sub-bass body thump),
+    // never instead of it
     function matchStrike() {
       if (!AC) return;
+      const t = AC.currentTime;
+
       if (matchBuf) {
         const src = AC.createBufferSource();
         src.buffer = matchBuf;
@@ -402,34 +405,45 @@
         g.gain.value = 0.9;
         src.connect(g);
         routeOut(g, 0);
-        src.start(AC.currentTime);
-        return;
+        src.start(t);
       }
-      const t = AC.currentTime;
+
+      // Phase 1: scratch — rough textured noise with crunch, like the original
+      const sr = AC.sampleRate;
+      const scratchLen = Math.floor(sr * 0.13);
+      const scratchBuf = AC.createBuffer(1, scratchLen, sr);
+      const sd = scratchBuf.getChannelData(0);
+      for (let i = 0; i < scratchLen; i++) {
+        const p = i / scratchLen;
+        const crunch = Math.sin(i * 0.3) * 0.3 + Math.sin(i * 0.7) * 0.2;
+        sd[i] = (Math.random() * 2 - 1 + crunch) * Math.pow(1 - p, 0.3) * (p < 0.1 ? p / 0.1 : 1);
+      }
       const sc = AC.createBufferSource();
-      sc.buffer = makeNoise(0.13, p => Math.pow(1 - p, 0.3) * (p < 0.1 ? p / 0.1 : 1));
+      sc.buffer = scratchBuf;
       const hp = AC.createBiquadFilter();
       hp.type = 'highpass';
       hp.frequency.setValueAtTime(2500, t);
       const sg = AC.createGain();
-      sg.gain.setValueAtTime(0.5, t);
+      sg.gain.setValueAtTime(0.55, t);
       sg.gain.exponentialRampToValueAtTime(0.001, t + 0.13);
       sc.connect(hp); hp.connect(sg);
       routeOut(sg, 0);
       sc.start(t);
 
+      // Phase 2: ignition pop + bloom
       const pop = AC.createOscillator();
       pop.type = 'sine';
       pop.frequency.setValueAtTime(220, t + 0.08);
       pop.frequency.exponentialRampToValueAtTime(60, t + 0.22);
       const pg = AC.createGain();
       pg.gain.setValueAtTime(0, t + 0.08);
-      pg.gain.linearRampToValueAtTime(0.55, t + 0.11);
+      pg.gain.linearRampToValueAtTime(0.6, t + 0.11);
       pg.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
       pop.connect(pg);
       routeOut(pg, 0);
       pop.start(t + 0.08); pop.stop(t + 0.38);
 
+      // Phase 3: flame whoosh rising
       const wh = AC.createBufferSource();
       wh.buffer = makeNoise(1.1, p => (p < 0.15 ? p / 0.15 : 1) * Math.pow(1 - p * 0.6, 0.8));
       const bp = AC.createBiquadFilter();
@@ -440,20 +454,21 @@
       bp.frequency.exponentialRampToValueAtTime(600, t + 1.2);
       const wg = AC.createGain();
       wg.gain.setValueAtTime(0, t + 0.1);
-      wg.gain.linearRampToValueAtTime(0.6, t + 0.35);
-      wg.gain.exponentialRampToValueAtTime(0.22, t + 1.0);
+      wg.gain.linearRampToValueAtTime(0.7, t + 0.35);
+      wg.gain.exponentialRampToValueAtTime(0.25, t + 1.0);
       wg.gain.exponentialRampToValueAtTime(0.001, t + 1.25);
       wh.connect(bp); bp.connect(wg);
       routeOut(wg, 0);
       wh.start(t + 0.1);
 
+      // Phase 4: sub bass body thump
       const body = AC.createOscillator();
       body.type = 'sine';
       body.frequency.setValueAtTime(80, t + 0.09);
       body.frequency.exponentialRampToValueAtTime(40, t + 0.4);
       const bg = AC.createGain();
       bg.gain.setValueAtTime(0, t + 0.09);
-      bg.gain.linearRampToValueAtTime(0.45, t + 0.14);
+      bg.gain.linearRampToValueAtTime(0.5, t + 0.14);
       bg.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
       body.connect(bg);
       routeOut(bg, 0);
