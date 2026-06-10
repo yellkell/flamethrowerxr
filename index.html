@@ -3,37 +3,53 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Flamethrower XR — Snake Spirals</title>
+  <title>Flame Thrower XR</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&display=swap" rel="stylesheet">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r134/three.min.js"></script>
   <style>
     html,body { margin:0; height:100%; overflow:hidden; background:#000; touch-action:none; }
     canvas { display:block; }
-    #ui {
-      position:absolute; top:15px; left:15px; color:#ffaa00;
-      font-family:sans-serif; text-shadow:0 0 12px #ff5500; z-index:10;
-      font-size:18px; letter-spacing:1px; pointer-events:none;
+    #intro-text {
+      position:fixed; top:38%; left:50%; transform:translate(-50%,-50%);
+      color:white; font-family:'Orbitron',sans-serif;
+      font-size:clamp(24px,5vw,36px); opacity:0; pointer-events:none;
+      text-align:center; line-height:1.5;
+      text-shadow:0 0 10px rgba(255,85,0,0.8); z-index:10;
+      min-height:3em; will-change:transform,opacity,filter,letter-spacing;
+    }
+    @keyframes textReveal {
+      0% { opacity:0; filter:blur(12px) brightness(2); transform:translate(-50%,-40%) scale(0.9); letter-spacing:-4px; }
+      100% { opacity:1; filter:blur(0px) brightness(1); transform:translate(-50%,-50%) scale(1); letter-spacing:0; }
+    }
+    @keyframes textHide {
+      0% { opacity:1; filter:blur(0px) brightness(1); transform:translate(-50%,-50%) scale(1); letter-spacing:0; }
+      100% { opacity:0; filter:blur(12px) brightness(0.5); transform:translate(-50%,-60%) scale(1.1); letter-spacing:6px; }
     }
     #hint {
       position:absolute; bottom:18px; left:50%; transform:translateX(-50%);
-      color:#ffcc66; font-family:sans-serif; font-size:13px; opacity:.75;
+      color:#ffcc66; font-family:'Orbitron',sans-serif; font-size:12px; opacity:.7;
       text-shadow:0 0 8px #ff5500; z-index:10; pointer-events:none; text-align:center;
       width:90%;
     }
     .btn {
       position:absolute; left:50%; transform:translateX(-50%);
-      padding:15px 30px; font-size:17px; font-weight:bold; color:#000;
-      background:linear-gradient(#ffcc33,#ff5500); border:none; border-radius:10px;
-      cursor:pointer; z-index:100; box-shadow:0 0 25px #ff5500;
-      font-family:sans-serif; letter-spacing:1px;
+      padding:14px 34px; font-size:16px; color:#ffcc88;
+      background:rgba(20,8,0,0.55); border:1px solid rgba(255,120,0,0.5);
+      border-radius:10px; cursor:pointer; z-index:100;
+      font-family:'Orbitron',sans-serif; letter-spacing:2px;
+      text-shadow:0 0 10px rgba(255,85,0,0.8);
+      box-shadow:0 0 18px rgba(255,85,0,0.25);
     }
-    #start   { top:46%; }
-    #preview { top:46%; margin-top:64px; background:linear-gradient(#666,#222); color:#fff; box-shadow:0 0 15px #000; font-size:14px; padding:12px 22px; }
+    #start   { top:60%; }
+    #preview { top:60%; margin-top:64px; font-size:13px; opacity:.8; }
   </style>
 </head>
 <body>
-  <div id="ui">FLAMETHROWER XR 🔥🐍</div>
-  <button id="start" class="btn">ENTER AR PASS-THROUGH</button>
-  <button id="preview" class="btn">👀 Preview in browser (no headset)</button>
+  <div id="intro-text">Take your time<br>Flame Thrower</div>
+  <button id="start" class="btn">ENTER AR</button>
+  <button id="preview" class="btn">Preview in browser</button>
   <div id="hint"></div>
 
   <script>
@@ -64,10 +80,11 @@
     // ignition arc: the room starts near-black, the title hovers mid-room,
     // and the first trigger pull strikes the match and lights the ball
     let lit = false;
-    const TINT_START = 0.97, TINT_INTRO = 0.78, TINT_LIT = 0.60;
+    const TINT_START = 0.97, TINT_INTRO = 0.86, TINT_LIT = 0.76;
     let tintLevel = TINT_START;
     let tintMat = null, tintMesh = null;
-    let titleSprite = null, titleMat = null, titleT = 0, titleGone = false;
+    let titleMesh = null, titleMat = null, titleTex = null, titleCtx = null;
+    let titleT = 0, titleGone = false, titleWhich = 0, titlePhase = 'in', titleHold = 0;
     const homePos = new THREE.Vector3(0, 1.3, -1.0);
     const UP = new THREE.Vector3(0, 1, 0);
     const ballRadius = 0.1;
@@ -96,8 +113,35 @@
     const startBtn = document.getElementById('start');
     const previewBtn = document.getElementById('preview');
     const hintEl = document.getElementById('hint');
+    const introEl = document.getElementById('intro-text');
     startBtn.addEventListener('click', () => init(false));
     previewBtn.addEventListener('click', () => init(true));
+
+    // landing page intro — cycles like the original until a mode is chosen
+    let entered = false;
+    (function cycleIntro() {
+      const reveal = () => {
+        introEl.style.animation = 'textReveal 2.5s cubic-bezier(0.2, 0.8, 0.2, 1) forwards';
+      };
+      try {
+        if (document.fonts && typeof document.fonts.ready?.then === 'function') {
+          document.fonts.ready.then(reveal).catch(reveal);
+        } else { setTimeout(reveal, 50); }
+      } catch (_) { setTimeout(reveal, 50); }
+      let which = 0;
+      setInterval(() => {
+        if (entered) { introEl.style.display = 'none'; return; }
+        introEl.style.animation = 'textHide 1.5s cubic-bezier(0.8, 0, 0.2, 1) forwards';
+        setTimeout(() => {
+          if (entered) return;
+          which ^= 1;
+          introEl.innerHTML = which === 0
+            ? 'Take your time<br>Flame Thrower'
+            : 'Pull the trigger<br>to strike the match';
+          introEl.style.animation = 'textReveal 2s cubic-bezier(0.2, 0.8, 0.2, 1) forwards';
+        }, 1600);
+      }, 5500);
+    })();
 
     if (navigator.xr) {
       navigator.xr.isSessionSupported('immersive-ar').then(ok => {
@@ -338,8 +382,8 @@
       velocity.set(Math.random() - 0.5, 0.3, Math.random() - 0.5)
         .normalize().multiplyScalar(CRUISE_SPEED);
       hintEl.textContent = isPreview
-        ? 'Drag to look, click to throw the fire. Watch the snakes hit the floor, find the walls, and climb.'
-        : 'Hold trigger to attract the fire — flick & release to throw. Snakes of flame climb your real walls 🔥';
+        ? 'Drag to look, click to throw the fire'
+        : 'Hold trigger to attract the fire — flick and release to throw';
     }
 
     /* ================= FIRE BALL ================= */
@@ -532,30 +576,50 @@
       depthWrite: false, side: THREE.DoubleSide
     });
 
-    // "FLAME THROWER" hovering in the middle of the darkened room
-    function makeTitle() {
-      const c = document.createElement('canvas');
-      c.width = 1024; c.height = 320;
-      const g = c.getContext('2d');
+    // intro text hovering above the ball — world-anchored (it does NOT
+    // billboard with your head), cycling between the two messages
+    function drawTitle(which) {
+      const g = titleCtx;
+      g.clearRect(0, 0, 1024, 320);
       g.textAlign = 'center';
       g.textBaseline = 'middle';
       g.shadowColor = 'rgba(255,85,0,0.9)';
-      g.shadowBlur = 40;
       g.fillStyle = '#ffd9a0';
-      g.font = 'bold 110px sans-serif';
-      g.fillText('FLAME THROWER', 512, 125);
-      g.shadowBlur = 18;
-      g.fillStyle = 'rgba(255,170,80,0.85)';
-      g.font = '40px sans-serif';
-      g.fillText('take your time', 512, 245);
-      titleMat = new THREE.SpriteMaterial({
-        map: new THREE.CanvasTexture(c), transparent: true,
-        opacity: 0, depthWrite: false
+      if (which === 0) {
+        g.shadowBlur = 24;
+        g.font = '46px Orbitron, sans-serif';
+        g.fillText('Take your time', 512, 90);
+        g.shadowBlur = 40;
+        g.font = '700 92px Orbitron, sans-serif';
+        g.fillText('Flame Thrower', 512, 210);
+      } else {
+        g.shadowBlur = 30;
+        g.font = '700 62px Orbitron, sans-serif';
+        g.fillText('Pull the trigger', 512, 105);
+        g.fillText('to strike the match', 512, 205);
+      }
+      titleTex.needsUpdate = true;
+    }
+
+    function makeTitle() {
+      const c = document.createElement('canvas');
+      c.width = 1024; c.height = 320;
+      titleCtx = c.getContext('2d');
+      titleTex = new THREE.CanvasTexture(c);
+      drawTitle(0);
+      titleMat = new THREE.MeshBasicMaterial({
+        map: titleTex, transparent: true, opacity: 0,
+        depthWrite: false, side: THREE.DoubleSide
       });
-      titleSprite = new THREE.Sprite(titleMat);
-      titleSprite.position.set(0, 1.5, -1.6);
-      titleSprite.scale.set(2.0, 0.625, 1);
-      scene.add(titleSprite);
+      titleMesh = new THREE.Mesh(new THREE.PlaneGeometry(2.0, 0.625), titleMat);
+      titleMesh.position.set(homePos.x, homePos.y + 0.5, homePos.z);
+      scene.add(titleMesh);
+      // redraw once Orbitron arrives so the texture picks up the real font
+      try {
+        if (document.fonts && typeof document.fonts.ready?.then === 'function') {
+          document.fonts.ready.then(() => { if (!titleGone) drawTitle(titleWhich); }).catch(() => {});
+        }
+      } catch (_) { }
     }
 
     function makeGlowTexture() {
@@ -983,7 +1047,11 @@
     /* ================= INTERACTION ================= */
     const ctrlVel = new THREE.Vector3();
     const ctrlPrev = new THREE.Vector3();
-    const orbitTangent = new THREE.Vector3();
+    // the ball's true motion, tracked every frame — releasing mid-flight
+    // keeps the momentum it actually has, wherever it is on its way to you
+    const ballVel = new THREE.Vector3();
+    const ballPrev = new THREE.Vector3();
+    let ballHasPrev = false;
     let ctrlHasPrev = false;
     let userInteracted = false;
     let holdTrail = null;
@@ -1008,9 +1076,9 @@
       if (holdTrail) { holdTrail.releaseDriven(); holdTrail = null; }
       if (mode !== 'attracted') return;
       mode = 'free';
-      velocity.copy(ctrlVel).multiplyScalar(2.0);     // your arm's throw
-      velocity.addScaledVector(orbitTangent, 2.2);    // plus the orbit's spin
-      velocity.y += 0.8;
+      velocity.copy(ballVel).multiplyScalar(1.2);   // the ball keeps its real momentum
+      velocity.addScaledVector(ctrlVel, 1.6);       // plus your arm's flick
+      velocity.y += 0.5;
       if (velocity.length() > 12) velocity.setLength(12);
       for (let i = 0; i < 7; i++) spawnAirFlame(ball.position, true);
       emberBurst(ball.position, 22);
@@ -1020,6 +1088,8 @@
     /* ================= INIT ================= */
     async function init(preview) {
       isPreview = preview;
+      entered = true;
+      introEl.style.display = 'none';
       startBtn.style.display = 'none';
       previewBtn.style.display = 'none';
       initAudio();
@@ -1065,7 +1135,6 @@
 
     /* ================= AR ================= */
     async function initXR() {
-      hintEl.textContent = 'Squeeze the trigger to strike the match 🔥';
       renderer.xr.enabled = true;
       try {
         xrSession = await navigator.xr.requestSession('immersive-ar', {
@@ -1095,7 +1164,7 @@
     let camYaw = 0, camPitch = 0, dragging = false, lastX = 0, lastY = 0;
     let downTime = 0, downX = 0, downY = 0, demoT = 0;
     function initPreview() {
-      hintEl.textContent = 'Preview — click to strike the match. (Open on a Quest for real AR.)';
+      hintEl.textContent = 'Preview mode — open on a headset for the real AR experience';
       const grid = new THREE.GridHelper(10, 20, 0xff6600, 0x331100);
       grid.material.opacity = 0.35; grid.material.transparent = true;
       scene.add(grid);
@@ -1180,18 +1249,32 @@
       tintMat.opacity = THREE.MathUtils.clamp(tintLevel - fireGlow, 0.3, TINT_START);
       tintMesh.position.setFromMatrixPosition(camera.matrixWorld);
 
-      // hovering title: fade in while dark, drift gently, burn away once lit
+      // hovering title above the ball: cycles between "Take your time /
+      // Flame Thrower" and "Pull the trigger to strike the match" until
+      // the user interacts, then burns away
       if (!titleGone) {
         titleT += dt;
-        titleSprite.position.y = 1.5 + Math.sin(titleT * 1.2) * 0.04;
-        if (!lit) {
-          titleMat.opacity = Math.min(0.95, (titleT / 2.5) * 0.95);
-        } else {
-          titleMat.opacity -= (dt / 1.2) * 0.95;
+        titleMesh.position.y = homePos.y + 0.5 + Math.sin(titleT * 1.2) * 0.02;
+        if (lit) {
+          titleMat.opacity -= dt;
           if (titleMat.opacity <= 0) {
-            scene.remove(titleSprite);
+            scene.remove(titleMesh);
             titleMat.dispose();
+            titleTex.dispose();
             titleGone = true;
+          }
+        } else if (titlePhase === 'in') {
+          titleMat.opacity = Math.min(0.95, titleMat.opacity + dt * 0.6);
+          if (titleMat.opacity >= 0.95) { titlePhase = 'hold'; titleHold = 0; }
+        } else if (titlePhase === 'hold') {
+          titleHold += dt;
+          if (titleHold > 3.8) titlePhase = 'out';
+        } else { // fade out, swap message, fade back in
+          titleMat.opacity = Math.max(0, titleMat.opacity - dt * 1.1);
+          if (titleMat.opacity <= 0) {
+            titleWhich ^= 1;
+            drawTitle(titleWhich);
+            titlePhase = 'in';
           }
         }
       }
@@ -1227,7 +1310,6 @@
           anchor.z + Math.sin(orbitAngle) * r
         );
         ball.position.lerp(_w, 1 - Math.exp(-12 * dt));
-        orbitTangent.set(-Math.sin(orbitAngle), 0.12, Math.cos(orbitAngle)).normalize();
         ballCore.material.uniforms.uHeat.value = 1.5;
       } else if (mode === 'free') {
         ballCore.material.uniforms.uHeat.value = 1.1;
@@ -1264,6 +1346,14 @@
         tempVec.y += Math.sin(idleTime * 1.5) * 0.04;
         ball.position.lerp(tempVec, 1 - Math.exp(-3 * dt));
       }
+
+      // track the ball's real velocity (smoothed) for momentum-true throws
+      if (ballHasPrev) {
+        _v.subVectors(ball.position, ballPrev).divideScalar(Math.max(dt, 1e-3));
+        ballVel.lerp(_v, 1 - Math.exp(-16 * dt));
+      }
+      ballPrev.copy(ball.position);
+      ballHasPrev = true;
 
       // dormant before the match strikes: a dark, faintly smoldering ember
       if (!lit) ballCore.material.uniforms.uHeat.value = 0.18;
