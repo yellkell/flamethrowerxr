@@ -419,10 +419,20 @@
       const group = new THREE.Group();
       const coreMat = new THREE.ShaderMaterial({
         uniforms: { uTime: { value: 0 }, uHeat: { value: 1.0 } },
-        vertexShader: `
+        vertexShader: NOISE_GLSL + `
+          uniform float uTime, uHeat;
           varying vec3 vPos;
-          void main(){ vPos=position;
-            gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+          void main(){
+            vPos = position;
+            vec3 n = normalize(position);
+            // displaced flame tongues: the silhouette writhes instead of
+            // reading as a perfect sphere, with taller licks toward the top
+            float upBias = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+            float disp = fbm(n * 2.6 + vec3(0.0, -uTime * 1.1, 0.0));
+            float amp = (0.012 + 0.045 * upBias) * min(uHeat, 1.5);
+            vec3 p = position + n * (disp * amp + max(disp, 0.0) * amp * upBias);
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+          }`,
         fragmentShader: NOISE_GLSL + `
           uniform float uTime, uHeat; varying vec3 vPos;
           void main(){
@@ -448,24 +458,43 @@
       );
       group.add(ballHot);
 
-      const glowMat = new THREE.ShaderMaterial({
-        uniforms: { uTime: { value: 0 } },
-        transparent: true, blending: THREE.AdditiveBlending,
-        side: THREE.BackSide, depthWrite: false,
+      // corona: a camera-facing quad with a noise-driven wavy rim and
+      // internal flame texture — irregular, alive, drifting upward, in
+      // place of the old uniform fresnel shell
+      const coronaMat = new THREE.ShaderMaterial({
+        uniforms: { uTime: { value: 0 }, uHeat: { value: 1.0 } },
+        transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
         vertexShader: `
-          varying vec3 vWN; varying vec3 vWP;
-          void main(){ vWN=normalize(mat3(modelMatrix)*normal);
-            vec4 wp=modelMatrix*vec4(position,1.0); vWP=wp.xyz;
-            gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
-        fragmentShader: `
-          uniform float uTime; varying vec3 vWN; varying vec3 vWP;
+          varying vec2 vUv;
+          void main(){ vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+        fragmentShader: NOISE_GLSL + `
+          uniform float uTime, uHeat;
+          varying vec2 vUv;
           void main(){
-            float f=pow(1.0-max(dot(normalize(vWN),normalize(cameraPosition-vWP)),0.0),2.2);
-            float pulse=0.85+0.15*sin(uTime*9.0);
-            gl_FragColor=vec4(vec3(1.0,0.45,0.08)*f*pulse, f);
+            vec2 p = vUv * 2.0 - 1.0;
+            p.y -= 0.10;                       // glow reaches higher than it hangs
+            float r = length(p);
+            if (r > 1.0) discard;
+            float ang = atan(p.y, p.x);
+            // wavy, licking rim — two noise octaves on the angle
+            vec3 q = vec3(cos(ang), sin(ang), 0.0) * 1.6;
+            float rim  = fbm(q + vec3(0.0, 0.0, uTime * 0.8));
+            float rim2 = fbm(q * 2.3 + vec3(0.0, uTime * 1.4, 7.0));
+            float maxR = 0.55 + rim * 0.28 + rim2 * 0.12;
+            // internal texture rises like heat
+            float tex = fbm(vec3(p * 2.8, uTime * 0.9) + vec3(0.0, -uTime * 1.3, 0.0)) * 0.5 + 0.5;
+            float fall = pow(clamp(1.0 - r / max(maxR, 0.2), 0.0, 1.0), 1.7);
+            float glow = fall * (0.45 + 0.75 * tex) * uHeat;
+            glow += pow(max(1.0 - r * 2.6, 0.0), 2.0) * 0.8; // hot kiss at the centre
+            vec3 col = vec3(1.0, 0.30, 0.02);
+            col = mix(col, vec3(1.0, 0.55, 0.08), clamp(fall * 1.4, 0.0, 1.0));
+            col = mix(col, vec3(1.0, 0.85, 0.35), pow(fall, 2.5));
+            float flick = 0.88 + 0.12 * sin(uTime * 23.0) * sin(uTime * 7.3 + 1.7);
+            gl_FragColor = vec4(col * glow * flick, glow);
           }`,
       });
-      ballGlow = new THREE.Mesh(new THREE.IcosahedronGeometry(0.17, 3), glowMat);
+      ballGlow = new THREE.Mesh(new THREE.PlaneGeometry(0.62, 0.62), coronaMat);
       group.add(ballGlow);
 
       group.position.copy(homePos);
@@ -1357,6 +1386,11 @@
 
       // dormant before the match strikes: a dark, faintly smoldering ember
       if (!lit) ballCore.material.uniforms.uHeat.value = 0.18;
+
+      // corona: face the viewer, share the core's heat, breathe gently
+      ballGlow.quaternion.copy(camera.quaternion);
+      ballGlow.material.uniforms.uHeat.value = ballCore.material.uniforms.uHeat.value;
+      ballGlow.scale.setScalar(1 + 0.05 * Math.sin(t * 9.7) + 0.04 * Math.sin(t * 5.3));
 
       // once lit the ball is always ablaze: licking tongues + a drizzle of embers
       if (lit) {
