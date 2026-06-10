@@ -160,7 +160,7 @@
      * Compact spatial echo of the original's sound identity:
      * pentatonic FM bells with combo-stepping on bounces, a soft sub thud,
      * a noise whoosh on throws, and a quick ignite arpeggio on grab. */
-    let AC = null, reverb = null, masterBus = null;
+    let AC = null, reverb = null, masterBus = null, matchBuf = null;
     const PENT = [164.81, 196.00, 220.00, 261.63, 293.66, 329.63, 392.00, 440.00, 523.25, 587.33];
     let lastBounceClock = -9, comboStep = 0;
 
@@ -184,6 +184,13 @@
         reverb.connect(rg);
         rg.connect(masterBus);
         if (AC.state === 'suspended') AC.resume().catch(() => {});
+        // recorded match strike — decoded async; matchStrike() falls back to
+        // the synthesized version until (or unless) this arrives
+        fetch('match_strike.mp3')
+          .then(r => r.ok ? r.arrayBuffer() : Promise.reject())
+          .then(ab => AC.decodeAudioData(ab))
+          .then(buf => { matchBuf = buf; })
+          .catch(() => {});
       } catch (e) { AC = null; }
     }
 
@@ -383,10 +390,21 @@
       rollTimer = null; rollGain = null; rollPan = null;
     }
 
-    // the original's four-phase match strike: scratch, ignition pop,
-    // rising flame whoosh, sub-bass body thump
+    // match strike: plays the recorded strike if it's loaded, otherwise the
+    // original's synthesized four-phase version (scratch, ignition pop,
+    // rising flame whoosh, sub-bass body thump)
     function matchStrike() {
       if (!AC) return;
+      if (matchBuf) {
+        const src = AC.createBufferSource();
+        src.buffer = matchBuf;
+        const g = AC.createGain();
+        g.gain.value = 0.9;
+        src.connect(g);
+        routeOut(g, 0);
+        src.start(AC.currentTime);
+        return;
+      }
       const t = AC.currentTime;
       const sc = AC.createBufferSource();
       sc.buffer = makeNoise(0.13, p => Math.pow(1 - p, 0.3) * (p < 0.1 ? p / 0.1 : 1));
