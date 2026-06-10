@@ -17,15 +17,19 @@
       font-size:clamp(24px,5vw,36px); opacity:0; pointer-events:none;
       text-align:center; line-height:1.5;
       text-shadow:0 0 10px rgba(255,85,0,0.8); z-index:10;
-      min-height:3em; will-change:transform,opacity,filter,letter-spacing;
+      width:90%; max-width:640px; min-height:3em;
+      will-change:transform,opacity,filter;
     }
+    /* No letter-spacing animation: CSS puts the spacing as trailing space
+       after the last glyph, which text-align:center counts, so animating it
+       slides the centered text sideways as it settles. */
     @keyframes textReveal {
-      0% { opacity:0; filter:blur(12px) brightness(2); transform:translate(-50%,-40%) scale(0.9); letter-spacing:-4px; }
-      100% { opacity:1; filter:blur(0px) brightness(1); transform:translate(-50%,-50%) scale(1); letter-spacing:0; }
+      0% { opacity:0; filter:blur(12px) brightness(2); transform:translate(-50%,-40%) scale(0.9); }
+      100% { opacity:1; filter:blur(0px) brightness(1); transform:translate(-50%,-50%) scale(1); }
     }
     @keyframes textHide {
-      0% { opacity:1; filter:blur(0px) brightness(1); transform:translate(-50%,-50%) scale(1); letter-spacing:0; }
-      100% { opacity:0; filter:blur(12px) brightness(0.5); transform:translate(-50%,-60%) scale(1.1); letter-spacing:6px; }
+      0% { opacity:1; filter:blur(0px) brightness(1); transform:translate(-50%,-50%) scale(1); }
+      100% { opacity:0; filter:blur(12px) brightness(0.5); transform:translate(-50%,-60%) scale(1.1); }
     }
     #hint {
       position:absolute; bottom:18px; left:50%; transform:translateX(-50%);
