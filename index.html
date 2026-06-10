@@ -1133,24 +1133,104 @@
       colliders = list;
     }
 
+    /* ================= SCORCH SMUDGES =================
+     * The ball leaves a black soot mark wherever it strikes a surface,
+     * which slowly fades away. Normal blending (not additive) so it
+     * genuinely darkens the passthrough wall behind it. */
+    let smudgeTex = null, smudgeGeo = null;
+    const smudges = [];
+    const MAX_SMUDGES = 24;
+
+    function makeSmudgeTexture() {
+      const c = document.createElement('canvas');
+      c.width = c.height = 128;
+      const x = c.getContext('2d');
+      // layered soft blots — an irregular soot splat, not a clean disc
+      for (let i = 0; i < 16; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const r = Math.random() * 30;
+        const cx = 64 + Math.cos(a) * r, cy = 64 + Math.sin(a) * r;
+        const rad = 12 + Math.random() * 28;
+        const g = x.createRadialGradient(cx, cy, 0, cx, cy, rad);
+        g.addColorStop(0, 'rgba(0,0,0,0.45)');
+        g.addColorStop(1, 'rgba(0,0,0,0)');
+        x.fillStyle = g;
+        x.fillRect(0, 0, 128, 128);
+      }
+      return new THREE.CanvasTexture(c);
+    }
+
+    const _zAxis = new THREE.Vector3(0, 0, 1);
+    function spawnSmudge(pos, normal, speed) {
+      if (!smudgeTex) { smudgeTex = makeSmudgeTexture(); smudgeGeo = new THREE.PlaneGeometry(1, 1); }
+      if (smudges.length >= MAX_SMUDGES) {
+        const old = smudges.shift();
+        scene.remove(old.mesh);
+        old.mesh.material.dispose();
+      }
+      const peak = Math.min(0.8, 0.35 + speed * 0.08);
+      const mat = new THREE.MeshBasicMaterial({
+        map: smudgeTex, transparent: true, depthWrite: false, opacity: peak
+      });
+      const mesh = new THREE.Mesh(smudgeGeo, mat);
+      const s = 0.16 + Math.min(0.22, speed * 0.035) + Math.random() * 0.06;
+      mesh.scale.set(s, s, 1);
+      // sit flush on the surface, a hair off to avoid z-fighting
+      mesh.position.copy(pos).addScaledVector(normal, 0.005);
+      mesh.quaternion.setFromUnitVectors(_zAxis, normal);
+      mesh.rotateZ(Math.random() * Math.PI * 2);
+      scene.add(mesh);
+      smudges.push({ mesh, age: 0, life: 7 + Math.random() * 4, peak });
+    }
+
+    function updateSmudges(dt) {
+      for (let i = smudges.length - 1; i >= 0; i--) {
+        const s = smudges[i];
+        s.age += dt;
+        const k = s.age / s.life;
+        if (k >= 1) {
+          scene.remove(s.mesh);
+          s.mesh.material.dispose();
+          smudges.splice(i, 1); // keep order so eviction always drops the oldest
+        } else {
+          s.mesh.material.opacity = s.peak * (1 - k * k); // lingers, then burns off
+        }
+      }
+    }
+
     /* ================= BALL PHYSICS ================= */
-    function collideBall(pos, vel, r) {
+    // Swept collision: test the segment the ball travelled this frame, not just
+    // where it ended up. A hard throw covers more than a ball-radius per frame,
+    // so a position-only test let it land beyond the wall — where the normal
+    // flip read it as "approaching from the other side" and never bounced.
+    const _b = new THREE.Vector3();
+    const _hitP = new THREE.Vector3();
+    const _stepFrom = new THREE.Vector3(); // ball position before this frame's move
+    function collideBall(pos, vel, r, prev) {
       for (const c of colliders) {
-        _a.subVectors(pos, c.point);
+        _a.subVectors(prev, c.point);
         _n.copy(c.normal);
-        let d = _a.dot(_n);
-        if (d < 0) { _n.negate(); d = -d; }
-        if (d > r || d < -r * 4) continue;
+        let dPrev = _a.dot(_n);
+        if (dPrev < 0) { _n.negate(); dPrev = -dPrev; } // orient toward where the ball started
+        _b.subVectors(pos, c.point);
+        const dNow = _b.dot(_n);
+        if (dNow > r) continue;                    // still clear of the plane
+        if (dPrev < 0.001 && dNow < -r) continue;  // started embedded/behind: not ours
+        const vn = vel.dot(_n);
+        if (vn >= 0) continue;                     // moving away
+        // first point along prev→pos where the ball surface touches the plane
+        const denom = dPrev - dNow;
+        const tHit = denom > 1e-6 ? THREE.MathUtils.clamp((dPrev - r) / denom, 0, 1) : 0;
+        _hitP.lerpVectors(prev, pos, tHit);
+        _a.subVectors(_hitP, c.point);
         const px = _a.dot(c.xAxis), pz = _a.dot(c.zAxis);
         if (Math.abs(px) > c.halfX + r || Math.abs(pz) > c.halfZ + r) continue;
-        const vn = vel.dot(_n);
-        if (vn < 0) {
-          const impactSpeed = -vn;
-          vel.addScaledVector(_n, -1.8 * vn);  // restitution 0.8 — lively, like the original
-          if (impactSpeed > 0.25) vel.multiplyScalar(0.96); // a whisper of friction on real hits
-          pos.addScaledVector(_n, r - d);
-          return { plane: c, normal: _n.clone(), speed: impactSpeed };
-        }
+        const impactSpeed = -vn;
+        vel.addScaledVector(_n, -1.8 * vn);  // restitution 0.8 — lively, like the original
+        if (impactSpeed > 0.25) vel.multiplyScalar(0.96); // a whisper of friction on real hits
+        const dAtHit = dPrev + (dNow - dPrev) * tHit;
+        pos.copy(_hitP).addScaledVector(_n, Math.max(0, r - dAtHit) + 0.001);
+        return { plane: c, normal: _n.clone(), speed: impactSpeed };
       }
       return null;
     }
@@ -1466,14 +1546,16 @@
             velocity.multiplyScalar(1 + 0.6 * dt); // gently regain cruising speed
           }
         }
+        _stepFrom.copy(ball.position); // where the ball was before this step
         ball.position.addScaledVector(velocity, dt);
-        const hit = collideBall(ball.position, velocity, ballRadius);
+        const hit = collideBall(ball.position, velocity, ballRadius, _stepFrom);
         if (hit && hit.speed > 0.25) {
           // impact point on the surface
           _v.copy(ball.position).addScaledVector(hit.normal, -ballRadius);
           spawnImpactSnakes(hit.plane, _v, hit.speed);
           emberBurst(_v, Math.min(20, 8 + Math.floor(hit.speed * 3)));
           bounceSound(_v, hit.normal, hit.speed);
+          spawnSmudge(_v, hit.normal, hit.speed);
         }
         if (ball.position.y < -3) { // escaped the room: re-enter, keep moving
           ball.position.copy(homePos);
@@ -1522,6 +1604,7 @@
         }
       }
       pool.update(dt);
+      updateSmudges(dt);
 
       renderer.render(scene, camera);
     }
