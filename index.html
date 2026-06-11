@@ -707,7 +707,11 @@
      * the surface and fade slowly — they are the 3D stand-in for the original
      * canvas's 3%-alpha clear, the painted-light afterglow the snakes leave. */
     class ParticlePool {
-      constructor(max) {
+      constructor(max, opts) {
+        opts = opts || {};
+        const maxPx = opts.maxPx || 60;        // screen-size clamp per sprite
+        const lifeExp = opts.lifeExp || 1.0;   // >1 = exponential-feel fade
+        const fallExp = opts.fallExp || 1.0;   // >1 = softer gaussian-ish edge
         this.max = max; this.cursor = 0;
         this.pos = new Float32Array(max * 3);
         this.vel = new Float32Array(max * 3);
@@ -732,14 +736,14 @@
             varying vec3 vColor; varying float vLife;
             void main(){ vColor=aColor; vLife=aLife;
               vec4 mv = modelViewMatrix * vec4(position,1.0);
-              gl_PointSize = clamp(aSize * (uScale / -mv.z), 1.0, 60.0);
+              gl_PointSize = clamp(aSize * (uScale / -mv.z), 1.0, ${maxPx.toFixed(1)});
               gl_Position = projectionMatrix * mv; }`,
           fragmentShader: `
             varying vec3 vColor; varying float vLife;
             void main(){ if(vLife<=0.0) discard;
               vec2 d = gl_PointCoord - 0.5; float r = length(d);
               if(r>0.5) discard;
-              float a = smoothstep(0.5,0.0,r) * vLife;
+              float a = pow(smoothstep(0.5,0.0,r), ${fallExp.toFixed(1)}) * pow(vLife, ${lifeExp.toFixed(1)});
               gl_FragColor = vec4(vColor * (0.7 + vLife*0.6), a); }`
         });
         this.points = new THREE.Points(g, this.mat);
@@ -790,6 +794,37 @@
       pool.spawn(_v, 0, 0, 0,
         _c.r * 0.4, _c.g * 0.4, _c.b * 0.4,
         1.6 + Math.random() * 0.8, size * (1.2 + Math.random() * 0.6), 0);
+    }
+
+    /* ================= BALL TRAIL =================
+     * The original never cleared its canvas — it faded it with 3% black per
+     * frame, so the ball dragged a long-exposure comet smear of its own glow
+     * everywhere it went. Replicated here by stamping the ball's glow along
+     * its path every few centimetres; each stamp decays on the same curve as
+     * that 3%-per-frame fade (≈ e^(-1.8t), gone in about two seconds). */
+    let trailPool = null;
+    const trailPrev = new THREE.Vector3();
+    let trailHasPrev = false;
+    const TRAIL_SPACING = 0.06; // metres of travel per stamp
+
+    function stampTrail(dt) {
+      if (!trailPool || !lit) { trailHasPrev = false; return; }
+      if (!trailHasPrev) { trailPrev.copy(ball.position); trailHasPrev = true; return; }
+      const moved = ball.position.distanceTo(trailPrev);
+      if (moved < TRAIL_SPACING) return;
+      const steps = Math.min(8, Math.floor(moved / TRAIL_SPACING));
+      for (let i = 1; i <= steps; i++) {
+        _v.lerpVectors(trailPrev, ball.position, i / steps);
+        // wide soft aura smear — the body of the comet tail
+        trailPool.spawn(_v, 0, 0, 0,
+          1.0, 0.30, 0.03,
+          1.5 + Math.random() * 0.4, 0.42 + Math.random() * 0.10, 0);
+        // hot bright core down the centre line, faster to fade
+        trailPool.spawn(_v, 0, 0, 0,
+          1.0, 0.72, 0.30,
+          0.55 + Math.random() * 0.2, 0.13 + Math.random() * 0.04, 0);
+      }
+      trailPrev.copy(ball.position);
     }
 
     /* ================= SNAKE RIBBON RENDERING ================= */
@@ -1442,6 +1477,10 @@
       ballHot.visible = false;
       pool = new ParticlePool(1600);
       scene.add(pool.points);
+      // the comet-tail pool: fewer, much bigger, softer stamps with an
+      // exponential-feel decay — the original's 3%-black canvas fade
+      trailPool = new ParticlePool(320, { maxPx: 800, lifeExp: 2.6, fallExp: 1.8 });
+      scene.add(trailPool.points);
       colliders = defaultRoom();
 
       // darkening pass — dims the passthrough so the fire's light owns the
@@ -1741,6 +1780,8 @@
         }
       }
       pool.update(dt);
+      stampTrail(dt);
+      trailPool.update(dt);
       updateSmudges(dt);
 
       renderer.render(scene, camera);
