@@ -217,8 +217,10 @@
       if (reverb) g.connect(reverb);
     }
 
-    // 2-op FM bell (3:1 ratio, fast mod-index decay) — the original's bounce voice
-    function bell(hz, when, peak, pan) {
+    // 2-op FM bell (3:1 ratio, fast mod-index decay) — the original's bounce voice.
+    // Pass `out` to route into a specific bus (a snake's bell-roll gain) instead
+    // of the default panner + reverb path.
+    function bell(hz, when, peak, pan, out) {
       const carrier = AC.createOscillator();
       carrier.type = 'sine';
       carrier.frequency.setValueAtTime(hz, when);
@@ -235,7 +237,8 @@
       g.gain.linearRampToValueAtTime(peak, when + 0.004);
       g.gain.exponentialRampToValueAtTime(0.0001, when + 0.35);
       carrier.connect(g);
-      routeOut(g, pan);
+      if (out) g.connect(out);
+      else routeOut(g, pan);
       carrier.start(when); mod.start(when);
       carrier.stop(when + 0.45); mod.stop(when + 0.45);
     }
@@ -251,9 +254,89 @@
       return buf;
     }
 
-    // bounce: pentatonic bell cascade, base note keyed to which surface was hit,
-    // combo-stepping when bounces land within half a second of each other
-    function bounceSound(pos, normal, speed) {
+    /* Bounce spirals own their sound for life, exactly like the original:
+     * the lead snake of each impact carries a scheduled bell roll that keeps
+     * playing as long as the spiral is visible — gain riding its opacity,
+     * pan tracking its head as it crawls — and dies when the spiral does.
+     * No more spirals writhing on after the sound has stopped. */
+    const BOUNCE_PATTERN = [0, 2, 4, 6, 4, 3, 5, 7, 5, 4, 2, 1];
+    const MAX_BELL_ROLLS = 4;
+    const bellRolls = [];
+    function attachBellRoll(snake, startIdx, baseVol) {
+      if (!AC) return;
+      while (bellRolls.length >= MAX_BELL_ROLLS) bellRolls.shift().kill(0.4);
+      const t = AC.currentTime;
+      const masterGain = AC.createGain();
+      masterGain.gain.setValueAtTime(baseVol, t);
+      let pan = null;
+      if (typeof AC.createStereoPanner === 'function') {
+        pan = AC.createStereoPanner();
+        pan.pan.value = panOf(snake.pts[0]);
+        masterGain.connect(pan);
+        pan.connect(masterBus);
+      } else {
+        masterGain.connect(masterBus);
+      }
+      if (reverb) masterGain.connect(reverb);
+
+      let nextT = t, patIdx = 0, dead = false, timer = null;
+      const roll = {
+        kill(fade) {
+          if (dead) return;
+          dead = true;
+          clearInterval(timer);
+          const ct = AC.currentTime;
+          masterGain.gain.cancelScheduledValues(ct);
+          masterGain.gain.setValueAtTime(Math.max(0.0001, masterGain.gain.value), ct);
+          masterGain.gain.exponentialRampToValueAtTime(0.0001, ct + (fade || 1.2));
+          setTimeout(() => {
+            try { masterGain.disconnect(); if (pan) pan.disconnect(); } catch (e) {}
+          }, ((fade || 1.2) + 0.3) * 1000);
+          const i = bellRolls.indexOf(roll);
+          if (i !== -1) bellRolls.splice(i, 1);
+        }
+      };
+      const tick = () => {
+        if (dead) return;
+        if (snake.opacity <= 0) { roll.kill(1.2); return; } // spiral died — so does the roll
+        const ct = AC.currentTime;
+        // ride the visual fade and follow the head around the room
+        masterGain.gain.setTargetAtTime(Math.max(0.0001, baseVol * snake.opacity), ct, 0.06);
+        if (pan) pan.pan.setTargetAtTime(panOf(snake.pts[0]), ct, 0.06);
+        const ahead = ct + 0.25;
+        while (nextT < ahead) {
+          const off = BOUNCE_PATTERN[patIdx % BOUNCE_PATTERN.length];
+          const idx = Math.min(PENT.length - 1, startIdx + off);
+          const hz = PENT[idx] * (1 + (Math.random() - 0.5) * 0.004);
+          const op = Math.max(0.15, snake.opacity);
+          // per-bell peak scales with opacity too, so late-life bells don't
+          // overshoot as the fade steepens (same trick as the original)
+          bell(hz, nextT, Math.max(0.1, 0.9 * op * (patIdx % 4 === 0 ? 1.1 : 0.85)), 0, masterGain);
+          // sparse high-octave shimmer grain every few bells
+          if (patIdx % 3 === 1) {
+            const gHz = PENT[Math.min(PENT.length - 1, idx + 3)] * 2;
+            const o = AC.createOscillator();
+            o.type = 'sine';
+            o.frequency.setValueAtTime(gHz, nextT);
+            const gg = AC.createGain();
+            gg.gain.setValueAtTime(0, nextT);
+            gg.gain.linearRampToValueAtTime(0.15 * op, nextT + 0.004);
+            gg.gain.exponentialRampToValueAtTime(0.0001, nextT + 0.05);
+            o.connect(gg); gg.connect(masterGain);
+            o.start(nextT); o.stop(nextT + 0.07);
+          }
+          nextT += 0.085;
+          patIdx++;
+        }
+      };
+      tick();
+      timer = setInterval(tick, 80);
+      bellRolls.push(roll);
+    }
+
+    // bounce: the lead spiral carries a lifetime bell roll, base note keyed to
+    // which surface was hit, combo-stepping on rapid bounces, sub thud under it
+    function bounceSound(pos, normal, speed, leadSnake) {
       if (!AC) return;
       const t = AC.currentTime;
       if (t - lastBounceClock > 0.5) comboStep = 0;
@@ -265,12 +348,15 @@
       else base = (normal.x + normal.z) > 0 ? 2 : 3; // walls
       const start = Math.min(PENT.length - 1, base + comboStep);
       const pan = panOf(pos);
-      const count = Math.min(6, 3 + Math.floor(speed));
-      const PAT = [0, 2, 4, 6, 4, 3];
       const vol = Math.min(0.42, 0.22 + speed * 0.04);
-      for (let i = 0; i < count; i++) {
-        const idx = Math.min(PENT.length - 1, start + PAT[i]);
-        bell(PENT[idx] * (1 + (Math.random() - 0.5) * 0.004), t + i * 0.085, vol * Math.pow(0.85, i), pan);
+      if (leadSnake) {
+        attachBellRoll(leadSnake, start, vol);
+      } else {
+        // spawn cooldown or snake cap hit: a brief cascade so it's never mute
+        [0, 2, 4].forEach((off, i) => {
+          const idx = Math.min(PENT.length - 1, start + off);
+          bell(PENT[idx] * (1 + (Math.random() - 0.5) * 0.004), t + i * 0.085, vol * Math.pow(0.85, i), pan);
+        });
       }
       // soft sub thud underneath
       const sub = AC.createOscillator();
@@ -1065,7 +1151,7 @@
     let lastImpactSpawn = 0;
     function spawnImpactSnakes(plane, point, speed) {
       const now = performance.now();
-      if (now - lastImpactSpawn < 130) return;
+      if (now - lastImpactSpawn < 130) return null;
       lastImpactSpawn = now;
       _a.subVectors(point, plane.point);
       const u = _a.dot(plane.xAxis);
@@ -1073,6 +1159,7 @@
       const count = Math.min(6, 2 + Math.floor(speed * 1.3));
       const upU = UP.dot(plane.xAxis), upV = UP.dot(plane.zAxis);
       const wallish = Math.hypot(upU, upV) > 0.25;
+      let lead = null; // the first snake carries the bounce's lifetime bell roll
       for (let i = 0; i < count; i++) {
         if (surfCount >= MAX_SURF_SNAKES) break;
         const s = new FireSnake(plane,
@@ -1083,7 +1170,9 @@
         // climbing in a writhing spread; on the floor they scatter everywhere
         if (wallish) s.angle = Math.atan2(upV, upU) + (Math.random() - 0.5) * 2.8;
         snakes.push(s);
+        if (!lead) lead = s;
       }
+      return lead;
     }
 
     // synthetic vertical plane at a point — the canvas air snakes writhe in
@@ -1585,9 +1674,9 @@
         if (hit && hit.speed > 0.25) {
           // impact point on the surface
           _v.copy(ball.position).addScaledVector(hit.normal, -ballRadius);
-          spawnImpactSnakes(hit.plane, _v, hit.speed);
+          const lead = spawnImpactSnakes(hit.plane, _v, hit.speed);
           emberBurst(_v, Math.min(20, 8 + Math.floor(hit.speed * 3)));
-          bounceSound(_v, hit.normal, hit.speed);
+          bounceSound(_v, hit.normal, hit.speed, lead);
           spawnSmudge(_v, hit.normal, hit.speed);
         }
         if (ball.position.y < -3) { // escaped the room: re-enter, keep moving
